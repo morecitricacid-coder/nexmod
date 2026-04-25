@@ -104,6 +104,27 @@ def test_list_empty_game(runner):
     assert "No mods tracked" in result.output
 
 
+def test_list_json_empty(runner):
+    result = runner.invoke(cli, ["list", "darktide", "--json"], catch_exceptions=False)
+    assert result.exit_code == 0
+    assert json.loads(result.output.strip()) == []
+
+
+def test_list_json_with_rows(runner):
+    db = nexmod.get_db()
+    db.execute(
+        "INSERT INTO mods (game, mod_id, file_id, name, filename, mod_dir, tracked_at) "
+        "VALUES ('darktide', 42, 7, 'TestMod', 'TestMod.zip', '/tmp/mods', '2026-01-01')"
+    )
+    db.commit()
+    result = runner.invoke(cli, ["list", "darktide", "--json"], catch_exceptions=False)
+    assert result.exit_code == 0
+    data = json.loads(result.output.strip())
+    assert len(data) == 1
+    assert data[0]["mod_id"] == 42
+    assert data[0]["name"] == "TestMod"
+
+
 # ── nexmod check (no API key) ─────────────────────────────────────────────────
 
 def test_check_exits_without_api_key(runner):

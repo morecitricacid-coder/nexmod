@@ -1610,10 +1610,18 @@ def track(game, mod_id):
 
 @cli.command("list")
 @click.argument("game")
-def list_mods(game):
+@click.option("--json", "as_json", is_flag=True,
+              help="Emit machine-readable JSON instead of a rich table.")
+def list_mods(game, as_json):
     """List tracked mods for GAME."""
     db   = get_db()
     rows = db.execute("SELECT * FROM mods WHERE game = ? ORDER BY name", (game,)).fetchall()
+
+    if as_json:
+        # Use stdlib print so JSON isn't decorated by Rich; scripts can pipe to jq.
+        print(json.dumps([dict(r) for r in rows]))
+        return
+
     if not rows:
         console.print(f"[yellow]No mods tracked for '{game}'.[/yellow]")
         return
