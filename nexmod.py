@@ -459,16 +459,20 @@ def do_install(game: str, mod_id: int, file_id_override: int | None,
     tmp.mkdir(parents=True, exist_ok=True)
     archive = tmp / chosen["file_name"]
 
+    extraction_ok = False
     try:
         download_file(download_url, archive)
         console.print(f"  Extracting to [dim]{mod_dir}[/dim]...")
         extract_archive(archive, mod_dir)
+        extraction_ok = True
     except Exception as e:
-        archive.unlink(missing_ok=True)
         record(db, "install", game, mod_id, mod["name"], mod.get("version"), "fail", str(e))
         raise
     finally:
         archive.unlink(missing_ok=True)
+
+    if not extraction_ok:
+        raise RuntimeError("Extraction did not complete — DB not written")
 
     db.execute("""
         INSERT OR REPLACE INTO mods
@@ -814,6 +818,10 @@ def scan_vortex(game, dry_run):
                 mod   = api_mod_info(domain, mod_id, api_key)
                 files = api_mod_files(domain, mod_id, api_key)
             chosen = pick_main_file(files)
+            # Store version=None intentionally: the files on disk came from Vortex/Windows
+            # and may be older than the current Nexus version. Storing the Nexus version
+            # would make 'update' say "current" when the actual installed files are outdated.
+            # With version=None, 'update' will download and install the current version.
             db.execute("""
                 INSERT OR IGNORE INTO mods
                     (game, mod_id, file_id, name, version, filename, mod_dir, tracked_at)
@@ -821,13 +829,14 @@ def scan_vortex(game, dry_run):
             """, (
                 game, mod_id,
                 chosen["file_id"] if chosen else 0,
-                mod["name"], mod.get("version"),
+                mod["name"], None,
                 chosen["file_name"] if chosen else None,
                 str(mod_dir), now_iso(),
             ))
             db.commit()
-            record(db, "scan", game, mod_id, mod["name"], mod.get("version"), "ok")
-            console.print(f"  [green]✓[/green] [{mod_id}] {mod['name']} v{mod.get('version','?')}")
+            record(db, "scan", game, mod_id, mod["name"], None, "ok",
+                   f"nexus_version={mod.get('version','?')} (disk version unknown until update)")
+            console.print(f"  [green]✓[/green] [{mod_id}] {mod['name']} (nexus: v{mod.get('version','?')} — run update to install)")
             ok += 1
         except Exception as e:
             record(db, "scan", game, mod_id, vortex_name, None, "fail", str(e))
@@ -1021,17 +1030,20 @@ def update_mods(game, mod_id, yes):
         tmp.mkdir(parents=True, exist_ok=True)
         archive = tmp / chosen["file_name"]
 
+        extraction_ok = False
         try:
             download_file(download_url, archive)
             console.print(f"  Extracting to [dim]{mod_dir}[/dim]...")
             extract_archive(archive, mod_dir)
+            extraction_ok = True
         except Exception as e:
-            archive.unlink(missing_ok=True)
             record(db, "update", game, r["mod_id"], r["name"], latest, "fail", str(e))
             console.print(f"  [red]Failed: {e}[/red]")
-            continue
         finally:
             archive.unlink(missing_ok=True)
+
+        if not extraction_ok:
+            continue
 
         db.execute(
             "UPDATE mods SET file_id=?, version=?, filename=?, updated_at=? WHERE game=? AND mod_id=?",
