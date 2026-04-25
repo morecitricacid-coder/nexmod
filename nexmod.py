@@ -5,6 +5,8 @@ import click
 import requests
 import sqlite3
 import json
+import os
+import subprocess
 import zipfile
 import tarfile
 import shutil
@@ -27,8 +29,14 @@ DATA_DIR    = Path.home() / ".local" / "share" / "nexmod"
 CONFIG_FILE = CONFIG_DIR / "config.json"
 DB_FILE     = DATA_DIR / "mods.db"
 LOG_FILE    = DATA_DIR / "nexmod.log"
+WINE_PREFIX = DATA_DIR / "wine-prefix"
 
 NEXUS_API = "https://api.nexusmods.com/v1"
+
+if sys.version_info < (3, 10):
+    print("nexmod requires Python 3.10 or later. "
+          "Check your distro's python3 package or use pyenv.", file=sys.stderr)
+    sys.exit(1)
 
 GAMES = {
     "darktide": {
@@ -231,9 +239,10 @@ def api_updated_mods(domain: str, api_key: str, period: str = "1w") -> list:
 
 def find_steam_library_paths() -> list[Path]:
     base_candidates = [
-        Path.home() / ".local/share/Steam",
-        Path.home() / ".steam/steam",
-        Path("/usr/local/share/Steam"),
+        Path.home() / ".local/share/Steam",                                        # native deb/rpm
+        Path.home() / ".steam/steam",                                              # symlink variant
+        Path.home() / ".var/app/com.valvesoftware.Steam/.local/share/Steam",       # Flatpak
+        Path("/usr/local/share/Steam"),                                            # system-wide
     ]
     libraries = []
     for base in base_candidates:
@@ -275,15 +284,16 @@ def find_game_install(steam_id: int) -> Path | None:
 
 def find_proton_appdata(steam_id: int) -> Path | None:
     """Return the Wine drive_c/users/steamuser/AppData/Roaming path for a Proton game."""
-    proton_base = Path.home() / ".local/share/Steam/steamapps/compatdata" / str(steam_id)
-    candidate = proton_base / "pfx/drive_c/users/steamuser/AppData/Roaming"
-    if candidate.exists():
-        return candidate
-    # Some installs use ~/.steam/steam
-    proton_base2 = Path.home() / ".steam/steam/steamapps/compatdata" / str(steam_id)
-    candidate2 = proton_base2 / "pfx/drive_c/users/steamuser/AppData/Roaming"
-    if candidate2.exists():
-        return candidate2
+    _pfx = f"steamapps/compatdata/{steam_id}/pfx/drive_c/users/steamuser/AppData/Roaming"
+    search_roots = [
+        Path.home() / ".local/share/Steam",
+        Path.home() / ".steam/steam",
+        Path.home() / ".var/app/com.valvesoftware.Steam/.local/share/Steam",  # Flatpak
+    ]
+    for root in search_roots:
+        candidate = root / _pfx
+        if candidate.exists():
+            return candidate
     return None
 
 
@@ -331,14 +341,29 @@ def extract_archive(archive: Path, target_dir: Path):
                 bad = zf.testzip()
                 if bad:
                     raise RuntimeError(f"Corrupt zip entry: {bad}")
+                for member in zf.infolist():
+                    mpath = member.filename
+                    if os.path.isabs(mpath) or ".." in mpath.split("/"):
+                        raise RuntimeError(f"Unsafe path in archive: {mpath}")
                 zf.extractall(target_dir)
         elif any(name.endswith(ext) for ext in (".tar.gz", ".tgz", ".tar.bz2", ".tar.xz", ".tar")):
             with tarfile.open(archive) as tf:
-                tf.extractall(target_dir)
+                if sys.version_info >= (3, 12):
+                    tf.extractall(target_dir, filter="data")
+                else:
+                    tf.extractall(target_dir)
         elif name.endswith(".7z"):
-            import subprocess
+            _7z = shutil.which("7z") or shutil.which("7zz") or shutil.which("7za")
+            if not _7z:
+                raise RuntimeError(
+                    "7z not found. Install it:\n"
+                    "  Ubuntu/Debian: sudo apt install p7zip-full\n"
+                    "  Arch:          sudo pacman -S p7zip\n"
+                    "  Fedora:        sudo dnf install p7zip p7zip-plugins\n"
+                    "  openSUSE:      sudo zypper install p7zip"
+                )
             result = subprocess.run(
-                ["7z", "x", str(archive), f"-o{target_dir}", "-y"],
+                [_7z, "x", str(archive), f"-o{target_dir}", "-y"],
                 capture_output=True, text=True,
             )
             if result.returncode != 0:
@@ -424,7 +449,11 @@ def do_install(game: str, mod_id: int, file_id_override: int | None,
     with console.status("Getting CDN download link..."):
         urls = api_download_urls(domain, mod_id, chosen["file_id"], api_key)
 
-    download_url = urls[0]["URI"]
+    if not urls:
+        raise RuntimeError("Nexus returned no download URLs — check your Premium status")
+    download_url = urls[0].get("URI") or urls[0].get("url")
+    if not download_url:
+        raise RuntimeError(f"Unexpected URL format from Nexus API: {urls[0]}")
     mod_dir = resolve_mod_dir(game, db)
     tmp = DATA_DIR / "tmp"
     tmp.mkdir(parents=True, exist_ok=True)
@@ -554,12 +583,19 @@ def show_logs(lines, errors, follow):
         return
 
     if follow:
-        import subprocess
-        args = ["tail", "-f", str(LOG_FILE)]
         if errors:
-            subprocess.run(f"tail -f {LOG_FILE} | grep -E 'ERROR|WARNING'", shell=True)
+            tail = subprocess.Popen(["tail", "-f", str(LOG_FILE)], stdout=subprocess.PIPE)
+            grep = subprocess.Popen(
+                ["grep", "--line-buffered", "-E", "ERROR|WARNING"],
+                stdin=tail.stdout,
+            )
+            try:
+                grep.wait()
+            except KeyboardInterrupt:
+                tail.terminate()
+                grep.terminate()
         else:
-            subprocess.run(args)
+            subprocess.run(["tail", "-f", str(LOG_FILE)])
         return
 
     text = LOG_FILE.read_text()
@@ -992,7 +1028,15 @@ def update_mods(game, mod_id, yes):
         with console.status("Getting CDN link..."):
             urls = api_download_urls(domain, r["mod_id"], chosen["file_id"], api_key)
 
-        download_url = urls[0]["URI"]
+        if not urls:
+            record(db, "update", game, r["mod_id"], r["name"], latest, "fail", "no download URLs")
+            console.print(f"  [red]No download URLs returned — check Premium status.[/red]")
+            continue
+        download_url = urls[0].get("URI") or urls[0].get("url")
+        if not download_url:
+            record(db, "update", game, r["mod_id"], r["name"], latest, "fail", f"bad URL format: {urls[0]}")
+            console.print(f"  [red]Unexpected URL format from Nexus — skipping.[/red]")
+            continue
         mod_dir      = resolve_mod_dir(game, db)
         tmp          = DATA_DIR / "tmp"
         tmp.mkdir(parents=True, exist_ok=True)
@@ -1055,8 +1099,6 @@ def remove_mod(game, mod_id, purge):
 
 # enable / disable / toggle ───────────────────────────────────────────────────
 
-WINE_PREFIX = DATA_DIR / "wine-prefix"
-
 def _find_dtkit(game_dir: Path) -> Path | None:
     for name in ("dtkit-patch.exe", "dtkit-patch"):
         p = game_dir / "tools" / name
@@ -1066,17 +1108,21 @@ def _find_dtkit(game_dir: Path) -> Path | None:
 
 def _run_dtkit(game_dir: Path, action: str) -> tuple[bool, str]:
     """Run dtkit-patch via Wine. action: --patch | --unpatch | --toggle"""
+    if not shutil.which("wine"):
+        return False, (
+            "Wine not found. Install it:\n"
+            "  Ubuntu/Debian: sudo apt install wine\n"
+            "  Arch:          sudo pacman -S wine\n"
+            "  Fedora:        sudo dnf install wine\n"
+            "  openSUSE:      sudo zypper install wine\n"
+            "  Flatpak:       flatpak install flathub org.winehq.Wine"
+        )
     dtkit = _find_dtkit(game_dir)
     if not dtkit:
         return False, f"dtkit-patch.exe not found in {game_dir}/tools/"
 
     bundle_win = f"Z:{game_dir}/bundle"
-    env = {
-        **__import__("os").environ,
-        "WINEPREFIX": str(WINE_PREFIX),
-        "WINEDEBUG": "-all",
-    }
-    import subprocess
+    env = {**os.environ, "WINEPREFIX": str(WINE_PREFIX), "WINEDEBUG": "-all"}
     result = subprocess.run(
         ["wine", str(dtkit), action, bundle_win],
         capture_output=True, text=True, env=env,
@@ -1086,17 +1132,6 @@ def _run_dtkit(game_dir: Path, action: str) -> tuple[bool, str]:
     clean = "\n".join(l for l in output.splitlines() if "radv" not in l.lower())
     log.debug("dtkit exit=%s output=%r", result.returncode, clean)
     return result.returncode == 0, clean
-
-def _dtkit_status(game_dir: Path) -> str | None:
-    """Return 'patched' or 'unpatched' by inspecting the bundle_database.data header."""
-    db_file = game_dir / "bundle" / "bundle_database.data"
-    if not db_file.exists():
-        return None
-    # dtkit writes a recognisable signature when patched
-    with open(db_file, "rb") as f:
-        header = f.read(64)
-    # The mod entry bundle presence is indicated by a known string in the header area
-    return "patched" if b"mod_main" in header or b"mods" in header else "unpatched"
 
 @cli.command("enable")
 @click.argument("game")
