@@ -615,6 +615,78 @@ def reorder_load_order(
     }
 
 
+# ── Missing Dependency Prompt ────────────────────────────────────────────────
+
+def _handle_missing_deps(
+    game: str,
+    missing_deps: dict[str, list[str]],
+    mod_dir: Path,
+    api_key: str,
+    db: sqlite3.Connection,
+) -> bool:
+    """Prompt the user to install any missing mod dependencies.
+
+    Two sub-cases:
+      - Dep folder exists on disk but not in load order → add silently.
+      - Dep not on disk → prompt for a Nexus URL, install if provided.
+
+    Returns True if any new mods were installed (caller should re-sort).
+    """
+    if not missing_deps:
+        return False
+
+    info            = GAMES.get(game, {})
+    load_order_file = info.get("load_order_file")
+    any_installed   = False
+
+    all_missing: dict[str, str] = {}  # dep_folder → declaring_mod
+    for declaring_mod, deps in missing_deps.items():
+        for dep in deps:
+            if dep not in all_missing:
+                all_missing[dep] = declaring_mod
+
+    for dep, declaring_mod in all_missing.items():
+        dep_path = mod_dir / dep
+        if dep_path.exists():
+            console.print(f"  [dim]{dep} is on disk but not in load order — adding automatically[/dim]")
+            if load_order_file:
+                _ensure_load_order(mod_dir, load_order_file, [dep])
+            continue
+
+        console.print(
+            f"\n[yellow]{declaring_mod}[/yellow] requires "
+            f"[bold]{dep}[/bold] which is not installed."
+        )
+        url = click.prompt(
+            f"  Paste the Nexus URL for '{dep}' to install it (Enter to skip)",
+            default="",
+            show_default=False,
+        ).strip()
+
+        if not url:
+            console.print(f"  [dim]Skipping {dep}[/dim]")
+            continue
+
+        try:
+            dep_game, dep_mod_id, dep_file_id = parse_nexus_url(url)
+            if dep_game != game:
+                console.print(
+                    f"  [yellow]Warning: URL points to game '{dep_game}', "
+                    f"installing for '{game}' instead.[/yellow]"
+                )
+                dep_game = game
+            dep_name, dep_ver = do_install(dep_game, dep_mod_id, dep_file_id, api_key, db)
+            console.print(f"  [green]✓ Installed dependency:[/green] {dep_name} v{dep_ver}")
+            any_installed = True
+        except SystemExit:
+            pass  # parse_nexus_url already printed the error
+        except Exception as e:
+            log.error("Failed to install dep %s: %s", dep, e)
+            console.print(f"  [red]Failed to install {dep}: {e}[/red]")
+
+    return any_installed
+
+
 # ── Install Helper ────────────────────────────────────────────────────────────
 
 def do_install(game: str, mod_id: int, file_id_override: int | None,
@@ -1107,14 +1179,18 @@ def install(game, mod_id, file_id, no_reorder):
     info = GAMES.get(game)
     if info and info.get("load_order_file") and not no_reorder and get_auto_reorder():
         mod_dir = resolve_mod_dir(game, db)
-        result  = reorder_load_order(mod_dir, info["load_order_file"])
+        lof     = info["load_order_file"]
+        result  = reorder_load_order(mod_dir, lof)
         if result["changed"]:
             console.print(f"  [dim]Load order sorted ({len(result['order'])} mods)[/dim]")
         if result["cycles"]:
             console.print(f"  [yellow]Dependency cycle detected: {', '.join(result['cycles'])}[/yellow]")
         if result["missing_deps"]:
-            for folder, missing in result["missing_deps"].items():
-                console.print(f"  [yellow]{folder} requires {', '.join(missing)} (not installed)[/yellow]")
+            newly = _handle_missing_deps(game, result["missing_deps"], mod_dir, api_key, db)
+            if newly:
+                result2 = reorder_load_order(mod_dir, lof)
+                if result2["changed"]:
+                    console.print(f"  [dim]Load order re-sorted after dependency install[/dim]")
 
 
 # track ───────────────────────────────────────────────────────────────────────
@@ -1398,11 +1474,18 @@ def update_mods(game, mod_id, yes, no_reorder):
     info = GAMES.get(game, {})
     if info.get("load_order_file") and updated_count > 0 and not no_reorder and get_auto_reorder():
         mod_dir = resolve_mod_dir(game, db)
-        result  = reorder_load_order(mod_dir, info["load_order_file"])
+        lof     = info["load_order_file"]
+        result  = reorder_load_order(mod_dir, lof)
         if result["changed"]:
             console.print(f"[dim]Load order sorted ({len(result['order'])} mods)[/dim]")
         if result["cycles"]:
             console.print(f"[yellow]Dependency cycle detected: {', '.join(result['cycles'])}[/yellow]")
+        if result["missing_deps"]:
+            newly = _handle_missing_deps(game, result["missing_deps"], mod_dir, api_key, db)
+            if newly:
+                result2 = reorder_load_order(mod_dir, lof)
+                if result2["changed"]:
+                    console.print(f"[dim]Load order re-sorted after dependency install[/dim]")
 
 
 # remove ──────────────────────────────────────────────────────────────────────
