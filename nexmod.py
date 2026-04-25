@@ -33,6 +33,11 @@ WINE_PREFIX = DATA_DIR / "wine-prefix"
 
 NEXUS_API = "https://api.nexusmods.com/v1"
 
+NEXUS_URL_RE = re.compile(
+    r'nexusmods\.com/([^/?#]+)/mods/(\d+)(?:/files/(\d+))?',
+    re.IGNORECASE,
+)
+
 if sys.version_info < (3, 10):
     print("nexmod requires Python 3.10 or later. "
           "Check your distro's python3 package or use pyenv.", file=sys.stderr)
@@ -389,6 +394,43 @@ def pick_main_file(files: list) -> dict | None:
                 return f
     valid = [f for f in files if "OLD_VERSION" not in (f.get("category_name") or "").upper()]
     return max(valid, key=lambda f: f.get("uploaded_timestamp", 0)) if valid else None
+
+
+# ── Nexus URL Parser ─────────────────────────────────────────────────────────
+
+def parse_nexus_url(url: str) -> tuple[str, int, int | None]:
+    """Extract (game_slug, mod_id, file_id_or_None) from a Nexus Mods page URL.
+
+    Supports all common formats:
+      https://www.nexusmods.com/warhammer40kdarktide/mods/1234
+      https://www.nexusmods.com/warhammer40kdarktide/mods/1234/files/5678
+      https://www.nexusmods.com/warhammer40kdarktide/mods/1234?tab=files&file_id=5678
+    """
+    m = NEXUS_URL_RE.search(url)
+    if not m:
+        console.print(f"[red]Cannot parse Nexus URL: {url}[/red]")
+        console.print("[dim]Expected format: https://www.nexusmods.com/<game>/mods/<id>[/dim]")
+        sys.exit(1)
+
+    nexus_domain = m.group(1).lower()
+    mod_id       = int(m.group(2))
+    file_id      = int(m.group(3)) if m.group(3) else None
+
+    # Also check ?file_id= query param (Files tab with a file selected)
+    if file_id is None:
+        fid_m = re.search(r'[?&]file_id=(\d+)', url)
+        if fid_m:
+            file_id = int(fid_m.group(1))
+
+    domain_to_game = {info["domain"]: slug for slug, info in GAMES.items()}
+    game_slug = domain_to_game.get(nexus_domain)
+
+    if not game_slug:
+        game_slug = nexus_domain
+        console.print(f"[yellow]Unknown game domain '{nexus_domain}' — will try using it directly.[/yellow]")
+        console.print(f"[dim]If install fails, run: nexmod path set {nexus_domain} /path/to/mods[/dim]")
+
+    return game_slug, mod_id, file_id
 
 
 # ── Mod Dir Resolution ────────────────────────────────────────────────────────
@@ -1033,11 +1075,30 @@ def scan_vortex(game, dry_run):
 
 @cli.command("install")
 @click.argument("game")
-@click.argument("mod_id", type=int)
+@click.argument("mod_id", type=int, required=False, default=None)
 @click.option("--file-id", type=int, default=None, help="Force a specific file ID")
 @click.option("--no-reorder", is_flag=True, help="Skip automatic load order sort after install")
 def install(game, mod_id, file_id, no_reorder):
-    """Download and install a mod. Starts tracking it for updates."""
+    """Download and install a mod. Starts tracking it for updates.
+
+    \b
+    Accepts a Nexus Mods URL or a game slug + mod ID:
+      nexmod install https://www.nexusmods.com/warhammer40kdarktide/mods/1234
+      nexmod install darktide 1234
+    """
+    if "nexusmods.com" in game or game.startswith("http"):
+        parsed_game, parsed_mod_id, parsed_file_id = parse_nexus_url(game)
+        game   = parsed_game
+        mod_id = parsed_mod_id
+        if parsed_file_id and file_id is None:
+            file_id = parsed_file_id
+        console.print(f"  [dim]Parsed URL → game=[cyan]{game}[/cyan]  mod_id=[cyan]{mod_id}[/cyan]"
+                      + (f"  file_id=[cyan]{file_id}[/cyan]" if file_id else "") + "[/dim]")
+    elif mod_id is None:
+        console.print("[red]Usage:  nexmod install <game> <mod_id>[/red]")
+        console.print("        nexmod install <nexus-url>")
+        sys.exit(1)
+
     api_key = get_api_key()
     db = get_db()
     name, version = do_install(game, mod_id, file_id, api_key, db)
@@ -1060,9 +1121,23 @@ def install(game, mod_id, file_id, no_reorder):
 
 @cli.command("track")
 @click.argument("game")
-@click.argument("mod_id", type=int)
+@click.argument("mod_id", type=int, required=False, default=None)
 def track(game, mod_id):
-    """Track an already-installed mod so nexmod can check it for updates."""
+    """Track an already-installed mod so nexmod can check it for updates.
+
+    \b
+    Accepts a Nexus Mods URL or a game slug + mod ID:
+      nexmod track https://www.nexusmods.com/warhammer40kdarktide/mods/1234
+      nexmod track darktide 1234
+    """
+    if "nexusmods.com" in game or game.startswith("http"):
+        game, mod_id, _ = parse_nexus_url(game)
+        console.print(f"  [dim]Parsed URL → game=[cyan]{game}[/cyan]  mod_id=[cyan]{mod_id}[/cyan][/dim]")
+    elif mod_id is None:
+        console.print("[red]Usage:  nexmod track <game> <mod_id>[/red]")
+        console.print("        nexmod track <nexus-url>")
+        sys.exit(1)
+
     api_key = get_api_key()
     db      = get_db()
     info    = GAMES.get(game)
