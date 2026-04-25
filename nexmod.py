@@ -24,12 +24,13 @@ from rich.syntax import Syntax
 console = Console()
 log = logging.getLogger("nexmod")
 
-CONFIG_DIR  = Path.home() / ".config" / "nexmod"
-DATA_DIR    = Path.home() / ".local" / "share" / "nexmod"
-CONFIG_FILE = CONFIG_DIR / "config.json"
-DB_FILE     = DATA_DIR / "mods.db"
-LOG_FILE    = DATA_DIR / "nexmod.log"
-WINE_PREFIX = DATA_DIR / "wine-prefix"
+CONFIG_DIR   = Path.home() / ".config" / "nexmod"
+DATA_DIR     = Path.home() / ".local" / "share" / "nexmod"
+CONFIG_FILE  = CONFIG_DIR / "config.json"
+PROFILES_DIR = CONFIG_DIR / "profiles"
+DB_FILE      = DATA_DIR / "mods.db"
+LOG_FILE     = DATA_DIR / "nexmod.log"
+WINE_PREFIX  = DATA_DIR / "wine-prefix"
 
 NEXUS_API = "https://api.nexusmods.com/v1"
 
@@ -799,6 +800,70 @@ def parse_vortex_manifest(game_dir: Path) -> dict[int, tuple[str, str]]:
     return seen
 
 
+# ── Profiles ─────────────────────────────────────────────────────────────────
+
+def _profile_path(game: str, name: str) -> Path:
+    return PROFILES_DIR / game / f"{name}.json"
+
+
+def _read_profile(game: str, name: str) -> dict:
+    path = _profile_path(game, name)
+    if not path.exists():
+        console.print(f"[red]Profile '{name}' not found for {game}.[/red]")
+        console.print(f"Run 'nexmod profile list {game}' to see available profiles.")
+        sys.exit(1)
+    return json.loads(path.read_text())
+
+
+def _write_profile(game: str, name: str, load_order: list[str], description: str = "") -> Path:
+    path = _profile_path(game, name)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    existing_created = None
+    if path.exists():
+        try:
+            existing_created = json.loads(path.read_text()).get("created_at")
+        except Exception:
+            pass
+    data = {
+        "name":        name,
+        "game":        game,
+        "description": description,
+        "created_at":  existing_created or now_iso(),
+        "updated_at":  now_iso(),
+        "load_order":  load_order,
+    }
+    path.write_text(json.dumps(data, indent=2))
+    return path
+
+
+def _list_profiles(game: str) -> list[dict]:
+    d = PROFILES_DIR / game
+    if not d.exists():
+        return []
+    profiles = []
+    for f in sorted(d.glob("*.json")):
+        try:
+            profiles.append(json.loads(f.read_text()))
+        except Exception:
+            pass
+    return profiles
+
+
+def _apply_profile(mod_dir: Path, load_order_file: str, load_order: list[str]):
+    """Write a profile's load order list to mod_load_order.txt."""
+    lof = mod_dir / load_order_file
+    header = ["-- File managed by nexmod (https://github.com/YOUR_USERNAME/nexmod)"]
+    lof.write_text("\n".join(header + load_order) + "\n")
+
+
+def _read_lof_folders(mod_dir: Path, load_order_file: str) -> list[str]:
+    lof = mod_dir / load_order_file
+    if not lof.exists():
+        return []
+    return [l.strip() for l in lof.read_text().splitlines()
+            if l.strip() and not l.strip().startswith("--")]
+
+
 # ── CLI ───────────────────────────────────────────────────────────────────────
 
 @click.group()
@@ -869,6 +934,220 @@ def config_auto_reorder(state):
     save_config(cfg)
     label = "[green]on[/green]" if cfg["auto_reorder"] else "[yellow]off[/yellow]"
     console.print(f"auto_reorder → {label}")
+
+
+# profile ─────────────────────────────────────────────────────────────────────
+
+@cli.group()
+def profile():
+    """Named mod profiles for hotswapping load order arrangements."""
+    pass
+
+
+@profile.command("save")
+@click.argument("game")
+@click.argument("name")
+@click.option("--description", "-d", default="", help="Short description stored with the profile")
+@click.option("--force", "-f", is_flag=True, help="Overwrite without prompting if profile exists")
+def profile_save(game, name, description, force):
+    """Snapshot the current load order as a named profile.
+
+    \b
+    Examples:
+      nexmod profile save darktide full
+      nexmod profile save darktide minimal -d "QoL only, no combat changes"
+    """
+    info = GAMES.get(game)
+    if not info or not info.get("load_order_file"):
+        console.print(f"[yellow]{game} does not support a managed load order.[/yellow]")
+        return
+
+    db      = get_db()
+    mod_dir = resolve_mod_dir(game, db)
+    folders = _read_lof_folders(mod_dir, info["load_order_file"])
+
+    if not folders:
+        console.print(f"[yellow]Load order file is empty or missing for {game}.[/yellow]")
+        return
+
+    path = _profile_path(game, name)
+    if path.exists() and not force:
+        if not click.confirm(f"Profile '{name}' already exists. Overwrite?", default=False):
+            console.print("[dim]Aborted.[/dim]")
+            return
+
+    _write_profile(game, name, folders, description)
+    log.info("Profile '%s' saved for %s (%d mods)", name, game, len(folders))
+    console.print(f"[green]✓ Profile saved:[/green] {name} ({len(folders)} mods)")
+
+
+@profile.command("list")
+@click.argument("game")
+def profile_list(game):
+    """List all saved profiles for GAME."""
+    profiles = _list_profiles(game)
+    if not profiles:
+        console.print(f"[yellow]No profiles saved for {game}.[/yellow]")
+        console.print(f"Create one: nexmod profile save {game} <name>")
+        return
+
+    t = Table(title=f"Profiles — {game}", show_lines=False)
+    t.add_column("Name",        style="bold cyan")
+    t.add_column("Mods",        justify="right", style="dim")
+    t.add_column("Updated",     style="dim")
+    t.add_column("Description")
+    for p in profiles:
+        t.add_row(
+            p["name"],
+            str(len(p.get("load_order", []))),
+            (p.get("updated_at") or p.get("created_at") or "?")[:10],
+            p.get("description") or "",
+        )
+    console.print(t)
+
+
+@profile.command("show")
+@click.argument("game")
+@click.argument("name")
+def profile_show(game, name):
+    """Print the full mod list stored in a profile."""
+    p      = _read_profile(game, name)
+    order  = p.get("load_order", [])
+    db     = get_db()
+    info   = GAMES.get(game, {})
+
+    # Check which profile mods are missing from disk right now
+    missing_on_disk: set[str] = set()
+    if info.get("load_order_file"):
+        mod_dir = resolve_mod_dir(game, db)
+        missing_on_disk = {f for f in order if not (mod_dir / f).exists()}
+
+    t = Table(
+        title=f"Profile: [bold]{name}[/bold] ({game})",
+        show_lines=False, box=None, padding=(0, 1),
+    )
+    t.add_column("#",      style="dim", width=4, justify="right")
+    t.add_column("Folder", style="bold")
+    t.add_column("",       width=10)
+    for i, folder in enumerate(order, 1):
+        flag = "[red]missing[/red]" if folder in missing_on_disk else ""
+        t.add_row(str(i), folder, flag)
+    console.print(t)
+
+    if p.get("description"):
+        console.print(f"\n[dim]{p['description']}[/dim]")
+    if missing_on_disk:
+        console.print(f"\n[yellow]{len(missing_on_disk)} mod(s) in this profile are not on disk.[/yellow]")
+
+
+@profile.command("load")
+@click.argument("game")
+@click.argument("name")
+@click.option("--dry-run", is_flag=True, help="Show what would change without writing anything")
+def profile_load(game, name, dry_run):
+    """Apply a profile — rewrites the load order file with the profile's mod list.
+
+    Mods not in the profile stay on disk but won't be loaded by the game.
+
+    \b
+    Examples:
+      nexmod profile load darktide minimal
+      nexmod profile load darktide full --dry-run
+    """
+    info = GAMES.get(game)
+    if not info or not info.get("load_order_file"):
+        console.print(f"[yellow]{game} does not support a managed load order.[/yellow]")
+        return
+
+    p         = _read_profile(game, name)
+    db        = get_db()
+    mod_dir   = resolve_mod_dir(game, db)
+    lof_file  = info["load_order_file"]
+
+    profile_order = p.get("load_order", [])
+    current_order = _read_lof_folders(mod_dir, lof_file)
+
+    profile_set  = set(profile_order)
+    current_set  = set(current_order)
+    added        = [m for m in profile_order if m not in current_set]
+    removed      = [m for m in current_order  if m not in profile_set]
+    unchanged    = len(profile_order) - len(added)
+
+    # Warn about profile mods not on disk
+    missing_on_disk = [m for m in profile_order if not (mod_dir / m).exists()]
+
+    console.print(f"[bold]Profile:[/bold] {name}  "
+                  f"([cyan]{len(profile_order)}[/cyan] mods)")
+    if added:
+        console.print(f"  [green]+[/green] Enabling:  {', '.join(added)}")
+    if removed:
+        console.print(f"  [yellow]-[/yellow] Disabling: {', '.join(removed)}")
+    if not added and not removed:
+        console.print(f"  [dim]Load order already matches this profile — no changes.[/dim]")
+        return
+    if missing_on_disk:
+        console.print(f"\n  [red]Warning:[/red] {len(missing_on_disk)} profile mod(s) not on disk "
+                      f"(not installed): {', '.join(missing_on_disk[:5])}"
+                      + (" ..." if len(missing_on_disk) > 5 else ""))
+
+    if dry_run:
+        console.print("\n[dim]Dry run — no changes made.[/dim]")
+        return
+
+    _apply_profile(mod_dir, lof_file, profile_order)
+    log.info("Profile '%s' applied for %s (%d mods)", name, game, len(profile_order))
+    console.print(f"\n[green]✓ Profile '{name}' applied.[/green]")
+
+    all_disk = {d.name for d in mod_dir.iterdir() if d.is_dir()} if mod_dir.exists() else set()
+    sidelined = sorted(all_disk - profile_set - {"__MACOSX"})
+    if sidelined:
+        console.print(f"\n[dim]{len(sidelined)} installed mod(s) sidelined "
+                      f"(on disk, not in this profile):[/dim]")
+        shown = sidelined[:8]
+        console.print(f"  [dim]{', '.join(shown)}"
+                      + (f" … +{len(sidelined)-8} more" if len(sidelined) > 8 else "") + "[/dim]")
+
+
+@profile.command("delete")
+@click.argument("game")
+@click.argument("name")
+@click.option("--force", "-f", is_flag=True, help="Skip confirmation")
+def profile_delete(game, name, force):
+    """Delete a saved profile."""
+    path = _profile_path(game, name)
+    if not path.exists():
+        console.print(f"[red]Profile '{name}' not found for {game}.[/red]")
+        sys.exit(1)
+    if not force and not click.confirm(f"Delete profile '{name}'?", default=False):
+        console.print("[dim]Aborted.[/dim]")
+        return
+    path.unlink()
+    log.info("Profile '%s' deleted for %s", name, game)
+    console.print(f"[green]✓ Deleted profile '{name}'.[/green]")
+
+
+@profile.command("rename")
+@click.argument("game")
+@click.argument("old_name")
+@click.argument("new_name")
+def profile_rename(game, old_name, new_name):
+    """Rename a profile."""
+    old_path = _profile_path(game, old_name)
+    new_path = _profile_path(game, new_name)
+    if not old_path.exists():
+        console.print(f"[red]Profile '{old_name}' not found for {game}.[/red]")
+        sys.exit(1)
+    if new_path.exists():
+        console.print(f"[red]A profile named '{new_name}' already exists.[/red]")
+        sys.exit(1)
+    data = json.loads(old_path.read_text())
+    data["name"]       = new_name
+    data["updated_at"] = now_iso()
+    new_path.parent.mkdir(parents=True, exist_ok=True)
+    new_path.write_text(json.dumps(data, indent=2))
+    old_path.unlink()
+    log.info("Profile renamed %s → %s for %s", old_name, new_name, game)
+    console.print(f"[green]✓ Renamed '{old_name}' → '{new_name}'.[/green]")
 
 
 # logs ────────────────────────────────────────────────────────────────────────
