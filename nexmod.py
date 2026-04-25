@@ -895,6 +895,18 @@ def _apply_profile(mod_dir: Path, load_order_file: str, load_order: list[str]):
     lof.write_text("\n".join(header + load_order) + "\n")
 
 
+_ARCHIVE_EXTS = (".tar.gz", ".tar.bz2", ".tar.xz", ".tgz", ".zip", ".7z", ".tar", ".rar")
+
+
+def _archive_basename(filename: str) -> str:
+    """Strip a known archive extension. Falls back to single-suffix split."""
+    lower = filename.lower()
+    for ext in _ARCHIVE_EXTS:
+        if lower.endswith(ext):
+            return filename[: -len(ext)]
+    return filename.rsplit(".", 1)[0]
+
+
 def _read_lof_folders(mod_dir: Path, load_order_file: str) -> list[str]:
     lof = mod_dir / load_order_file
     if not lof.exists():
@@ -1084,7 +1096,9 @@ def profile_show(game, name):
 @click.argument("game")
 @click.argument("name")
 @click.option("--dry-run", is_flag=True, help="Show what would change without writing anything")
-def profile_load(game, name, dry_run):
+@click.option("--install", "do_install_missing", is_flag=True,
+              help="Install profile mods not on disk (uses tracked mod_id from the DB).")
+def profile_load(game, name, dry_run, do_install_missing):
     """Apply a profile — rewrites the load order file with the profile's mod list.
 
     Mods not in the profile stay on disk but won't be loaded by the game.
@@ -1093,7 +1107,12 @@ def profile_load(game, name, dry_run):
     Examples:
       nexmod profile load darktide minimal
       nexmod profile load darktide full --dry-run
+      nexmod profile load darktide full --install
     """
+    if dry_run and do_install_missing:
+        console.print("[red]--dry-run and --install are mutually exclusive.[/red]")
+        sys.exit(1)
+
     info = GAMES.get(game)
     if not info or not info.get("load_order_file"):
         console.print(f"[yellow]{game} does not support a managed load order.[/yellow]")
@@ -1122,13 +1141,48 @@ def profile_load(game, name, dry_run):
         console.print(f"  [green]+[/green] Enabling:  {', '.join(added)}")
     if removed:
         console.print(f"  [yellow]-[/yellow] Disabling: {', '.join(removed)}")
-    if not added and not removed:
+    if not added and not removed and not missing_on_disk:
         console.print(f"  [dim]Load order already matches this profile — no changes.[/dim]")
         return
     if missing_on_disk:
         console.print(f"\n  [red]Warning:[/red] {len(missing_on_disk)} profile mod(s) not on disk "
                       f"(not installed): {', '.join(missing_on_disk[:5])}"
                       + (" ..." if len(missing_on_disk) > 5 else ""))
+
+    if do_install_missing and missing_on_disk:
+        api_key = get_api_key()
+        rows    = db.execute(
+            "SELECT mod_id, name, filename FROM mods WHERE game = ?", (game,)
+        ).fetchall()
+        # folder name is the archive basename (extension stripped) — same
+        # convention used by 'remove --purge'. Build the lookup once.
+        folder_to_mod_id: dict[str, int] = {}
+        for r in rows:
+            if r["filename"]:
+                folder_to_mod_id[_archive_basename(r["filename"])] = r["mod_id"]
+
+        installed = 0
+        skipped: list[str] = []
+        for folder in missing_on_disk:
+            mod_id = folder_to_mod_id.get(folder)
+            if mod_id is None:
+                skipped.append(folder)
+                continue
+            console.print(f"\n[cyan]Installing[/cyan] {folder} (mod_id={mod_id})...")
+            try:
+                do_install(game, mod_id, None, api_key, db)
+                installed += 1
+            except Exception as e:
+                log.error("profile load --install failed for %s: %s", folder, e)
+                console.print(f"  [red]Install failed: {e}[/red]")
+                skipped.append(folder)
+
+        if skipped:
+            console.print(
+                f"\n[yellow]{len(skipped)} mod(s) could not be auto-installed "
+                f"(no DB record or install failed):[/yellow] {', '.join(skipped)}"
+            )
+        console.print(f"[green]Installed {installed}/{len(missing_on_disk)} missing profile mod(s).[/green]")
 
     if dry_run:
         console.print("\n[dim]Dry run — no changes made.[/dim]")
