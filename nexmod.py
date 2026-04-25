@@ -927,14 +927,6 @@ def check_updates(game):
     info   = GAMES.get(game, {})
     domain = info.get("domain", game)
 
-    with console.status("Fetching recently-updated mod list..."):
-        try:
-            updated_ids = {m["mod_id"] for m in api_updated_mods(domain, api_key)}
-            log.debug("Updated mods this week: %d", len(updated_ids))
-        except Exception as e:
-            log.warning("Could not fetch updated list, falling back to per-mod: %s", e)
-            updated_ids = set()
-
     t = Table(title=f"Update check — {game}", show_lines=False)
     t.add_column("Name")
     t.add_column("Installed", style="dim")
@@ -942,11 +934,9 @@ def check_updates(game):
     t.add_column("Status")
 
     for r in rows:
-        if updated_ids and r["mod_id"] not in updated_ids:
-            t.add_row(r["name"], r["version"] or "?", r["version"] or "?", "[green]Current[/green]")
-            continue
         try:
-            mod    = api_mod_info(domain, r["mod_id"], api_key)
+            with console.status(f"Checking {r['name']}..."):
+                mod    = api_mod_info(domain, r["mod_id"], api_key)
             latest = mod.get("version", "?")
             cur    = r["version"] or "?"
             status = "[green]Current[/green]" if latest == cur else f"[yellow]Update → {latest}[/yellow]"
@@ -983,19 +973,8 @@ def update_mods(game, mod_id, yes):
     info   = GAMES.get(game, {})
     domain = info.get("domain", game)
 
-    with console.status("Fetching recently-updated mod list..."):
-        try:
-            updated_ids = {m["mod_id"] for m in api_updated_mods(domain, api_key)}
-        except Exception as e:
-            log.warning("Could not fetch updated list: %s", e)
-            updated_ids = set()
-
     updated_count = 0
     for r in rows:
-        if updated_ids and r["mod_id"] not in updated_ids:
-            console.print(f"[dim]{r['name']}: current[/dim]")
-            continue
-
         with console.status(f"Checking {r['name']}..."):
             try:
                 mod    = api_mod_info(domain, r["mod_id"], api_key)
