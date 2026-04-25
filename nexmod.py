@@ -143,6 +143,8 @@ def get_db() -> sqlite3.Connection:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(DB_FILE)
     conn.row_factory = sqlite3.Row
+    # WAL: readers don't block writers (e.g. tail-style log views during update)
+    conn.execute("PRAGMA journal_mode=WAL")
     conn.executescript("""
         CREATE TABLE IF NOT EXISTS mods (
             id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -172,6 +174,8 @@ def get_db() -> sqlite3.Connection:
             status    TEXT NOT NULL,
             detail    TEXT
         );
+        CREATE INDEX IF NOT EXISTS idx_history_game_ts
+            ON history(game, timestamp);
     """)
     conn.commit()
     return conn
