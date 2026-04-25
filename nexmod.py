@@ -1098,15 +1098,6 @@ def profile_load(game, name, dry_run):
     log.info("Profile '%s' applied for %s (%d mods)", name, game, len(profile_order))
     console.print(f"\n[green]✓ Profile '{name}' applied.[/green]")
 
-    all_disk = {d.name for d in mod_dir.iterdir() if d.is_dir()} if mod_dir.exists() else set()
-    sidelined = sorted(all_disk - profile_set - {"__MACOSX"})
-    if sidelined:
-        console.print(f"\n[dim]{len(sidelined)} installed mod(s) sidelined "
-                      f"(on disk, not in this profile):[/dim]")
-        shown = sidelined[:8]
-        console.print(f"  [dim]{', '.join(shown)}"
-                      + (f" … +{len(sidelined)-8} more" if len(sidelined) > 8 else "") + "[/dim]")
-
 
 @profile.command("delete")
 @click.argument("game")
