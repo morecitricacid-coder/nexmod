@@ -45,6 +45,7 @@ GAMES = {
         "steam_id": 1361210,
         "mod_subdir": "mods",
         "log_subpath": "Fatshark/Darktide/console_log.txt",
+        "load_order_file": "mod_load_order.txt",
     },
     "skyrimse": {
         "name": "Skyrim Special Edition",
@@ -124,6 +125,9 @@ def get_api_key() -> str:
         console.print("Then run:  nexmod config set-key <key>")
         sys.exit(1)
     return key
+
+def get_auto_reorder() -> bool:
+    return load_config().get("auto_reorder", True)
 
 
 # ── Database ──────────────────────────────────────────────────────────────────
@@ -413,6 +417,162 @@ def resolve_mod_dir(game: str, db: sqlite3.Connection) -> Path:
     sys.exit(1)
 
 
+# ── Load Order ───────────────────────────────────────────────────────────────
+
+def _ensure_load_order(mod_dir: Path, load_order_file: str, folders: list[str]) -> list[str]:
+    """Append any folder names not already in load_order_file. Returns newly added names."""
+    lof = mod_dir / load_order_file
+    existing_lines = lof.read_text().splitlines() if lof.exists() else []
+    existing = {l.strip() for l in existing_lines if l.strip()}
+    added = [f for f in folders if f not in existing]
+    if added:
+        lines = existing_lines + added
+        lof.write_text("\n".join(lines) + "\n")
+        log.info("load_order: added %s", added)
+    return added
+
+
+def _parse_mod_deps(mod_dir: Path, folder: str) -> list[str]:
+    """Return declared dependency folder names for a mod.
+
+    Tries two formats in order:
+      1. mod.json  — {"dependencies": [...], "optional_dependencies": [...]}
+      2. <folder>.mod — Lua file with top-level require = {...} and load_after = {...} tables
+         require   = hard deps (mod won't work without them)
+         load_after = soft ordering hints (load after these if present)
+    """
+    deps: list[str] = []
+
+    # ── mod.json (BG3, generic) ───────────────────────────────────────────────
+    mod_json = mod_dir / folder / "mod.json"
+    if mod_json.exists():
+        try:
+            data = json.loads(mod_json.read_text(encoding="utf-8", errors="replace"))
+            deps += list(data.get("dependencies") or [])
+            deps += list(data.get("optional_dependencies") or [])
+        except Exception as e:
+            log.warning("Could not parse mod.json for %s: %s", folder, e)
+
+    # ── .mod Lua table (Darktide / DMF) ──────────────────────────────────────
+    # Top-level table fields: require = {"ModA", "ModB"}, load_after = {"ModC"}
+    # Both influence load order; require is hard, load_after is soft.
+    mod_file = mod_dir / folder / f"{folder}.mod"
+    if mod_file.exists():
+        try:
+            text = mod_file.read_text(encoding="utf-8", errors="replace")
+            for block in re.findall(
+                r'(?:require|load_after)\s*=\s*\{([^}]*)\}', text, re.DOTALL
+            ):
+                # Strip Lua line comments before extracting strings
+                block = re.sub(r'--[^\n]*', '', block)
+                deps.extend(re.findall(r'"([^"]+)"', block))
+        except Exception as e:
+            log.warning("Could not parse .mod file for %s: %s", folder, e)
+
+    # Dedup preserving first-seen order
+    seen: set[str] = set()
+    result = []
+    for d in (s.strip() for s in deps if s.strip()):
+        if d not in seen:
+            seen.add(d)
+            result.append(d)
+    return result
+
+
+def _topo_sort(
+    folders: list[str], deps_map: dict[str, list[str]]
+) -> tuple[list[str], list[str]]:
+    """Kahn's topological sort. Stable: ties broken by original position in `folders`.
+    deps_map[f] = list of folders that must appear BEFORE f (pre-filtered to known set).
+    Returns (sorted_list, cycle_nodes). Cycle nodes are appended after sorted_list by callers."""
+    rank = {f: i for i, f in enumerate(folders)}
+    dependents: dict[str, list[str]] = {f: [] for f in folders}
+    in_degree: dict[str, int] = {f: 0 for f in folders}
+
+    for f in folders:
+        for pred in deps_map.get(f, []):
+            if pred != f:
+                dependents[pred].append(f)
+                in_degree[f] += 1
+
+    queue = sorted([f for f in folders if in_degree[f] == 0], key=rank.__getitem__)
+    result: list[str] = []
+
+    while queue:
+        node = queue.pop(0)
+        result.append(node)
+        newly_ready = []
+        for dep in dependents[node]:
+            in_degree[dep] -= 1
+            if in_degree[dep] == 0:
+                newly_ready.append(dep)
+        if newly_ready:
+            queue = sorted(queue + newly_ready, key=rank.__getitem__)
+
+    cycles = [f for f in folders if f not in set(result)]
+    return result, cycles
+
+
+def reorder_load_order(
+    mod_dir: Path, load_order_file: str, dry_run: bool = False
+) -> dict:
+    """Sort mod_load_order.txt by mod.json dependency declarations using a topological sort.
+
+    Returns:
+        order        — final ordered list (sorted + cycles appended at end)
+        cycles       — folders involved in dependency cycles
+        missing_deps — {folder: [dep, ...]} for deps declared but absent from the file
+        deps_map     — {folder: [known_deps]} used for display
+        changed      — True if the order differs from the current file
+    """
+    lof = mod_dir / load_order_file
+    if not lof.exists():
+        return {"order": [], "cycles": [], "missing_deps": {}, "deps_map": {}, "changed": False}
+
+    lines = lof.read_text().splitlines()
+    # Strip all comment lines — nexmod writes its own header on every save.
+    folder_lines = [l.strip() for l in lines if l.strip() and not l.strip().startswith("--")]
+    header_comments = ["-- File managed by nexmod (https://github.com/YOUR_USERNAME/nexmod)"]
+
+    original = folder_lines
+    if not original:
+        return {"order": [], "cycles": [], "missing_deps": {}, "deps_map": {}, "changed": False}
+
+    folder_set = set(original)
+    deps_map: dict[str, list[str]] = {}
+    missing_deps: dict[str, list[str]] = {}
+
+    for folder in original:
+        raw = _parse_mod_deps(mod_dir, folder)
+        known   = [d for d in raw if d in folder_set]
+        missing = [d for d in raw if d not in folder_set]
+        deps_map[folder] = known
+        if missing:
+            missing_deps[folder] = missing
+
+    sorted_list, cycles = _topo_sort(original, deps_map)
+    order = sorted_list + cycles
+
+    existing_header = [l.strip() for l in lines if l.strip().startswith("--")]
+    header_changed  = existing_header != header_comments
+    changed = order != original
+    if (changed or header_changed) and not dry_run:
+        all_lines = header_comments + order
+        lof.write_text("\n".join(all_lines) + "\n")
+        if changed:
+            log.info("load_order reordered: %s", order)
+        if header_changed:
+            log.info("load_order header updated")
+
+    return {
+        "order": order,
+        "cycles": cycles,
+        "missing_deps": missing_deps,
+        "deps_map": deps_map,
+        "changed": changed,
+    }
+
+
 # ── Install Helper ────────────────────────────────────────────────────────────
 
 def do_install(game: str, mod_id: int, file_id_override: int | None,
@@ -459,6 +619,8 @@ def do_install(game: str, mod_id: int, file_id_override: int | None,
     tmp.mkdir(parents=True, exist_ok=True)
     archive = tmp / chosen["file_name"]
 
+    dirs_before = {p.name for p in mod_dir.iterdir() if p.is_dir()} if mod_dir.exists() else set()
+
     extraction_ok = False
     try:
         download_file(download_url, archive)
@@ -473,6 +635,15 @@ def do_install(game: str, mod_id: int, file_id_override: int | None,
 
     if not extraction_ok:
         raise RuntimeError("Extraction did not complete — DB not written")
+
+    load_order_file = (info or {}).get("load_order_file")
+    if load_order_file:
+        new_dirs = sorted({p.name for p in mod_dir.iterdir() if p.is_dir()} - dirs_before)
+        added = _ensure_load_order(mod_dir, load_order_file, new_dirs)
+        if added:
+            console.print(f"  [dim]mod_load_order.txt ← {', '.join(added)}[/dim]")
+        elif new_dirs:
+            console.print(f"  [dim]mod_load_order.txt: {', '.join(new_dirs)} already listed[/dim]")
 
     db.execute("""
         INSERT OR REPLACE INTO mods
@@ -550,11 +721,13 @@ def config_show():
     cfg = load_config()
     if "api_key" in cfg:
         k = cfg["api_key"]
-        console.print(f"api_key: {k[:8]}...{k[-4:]}")
+        console.print(f"api_key:      {k[:8]}...{k[-4:]}")
     else:
         console.print("[yellow]No API key configured.[/yellow]")
-    console.print(f"Log file:  {LOG_FILE}")
-    console.print(f"Database:  {DB_FILE}")
+    ar = cfg.get("auto_reorder", True)
+    console.print(f"auto_reorder: {'[green]on[/green]' if ar else '[yellow]off[/yellow]'}")
+    console.print(f"Log file:     {LOG_FILE}")
+    console.print(f"Database:     {DB_FILE}")
 
 @config.command("verify")
 def config_verify():
@@ -572,6 +745,16 @@ def config_verify():
     except Exception as e:
         log.error("API verify failed: %s", e)
         console.print(f"[red]API error: {e}[/red]")
+
+@config.command("auto-reorder")
+@click.argument("state", type=click.Choice(["on", "off"], case_sensitive=False))
+def config_auto_reorder(state):
+    """Enable or disable automatic load order sorting after install/update (default: on)."""
+    cfg = load_config()
+    cfg["auto_reorder"] = (state.lower() == "on")
+    save_config(cfg)
+    label = "[green]on[/green]" if cfg["auto_reorder"] else "[yellow]off[/yellow]"
+    console.print(f"auto_reorder → {label}")
 
 
 # logs ────────────────────────────────────────────────────────────────────────
@@ -852,12 +1035,25 @@ def scan_vortex(game, dry_run):
 @click.argument("game")
 @click.argument("mod_id", type=int)
 @click.option("--file-id", type=int, default=None, help="Force a specific file ID")
-def install(game, mod_id, file_id):
+@click.option("--no-reorder", is_flag=True, help="Skip automatic load order sort after install")
+def install(game, mod_id, file_id, no_reorder):
     """Download and install a mod. Starts tracking it for updates."""
     api_key = get_api_key()
     db = get_db()
     name, version = do_install(game, mod_id, file_id, api_key, db)
     console.print(f"\n[green]✓ Installed:[/green] {name} v{version}")
+
+    info = GAMES.get(game)
+    if info and info.get("load_order_file") and not no_reorder and get_auto_reorder():
+        mod_dir = resolve_mod_dir(game, db)
+        result  = reorder_load_order(mod_dir, info["load_order_file"])
+        if result["changed"]:
+            console.print(f"  [dim]Load order sorted ({len(result['order'])} mods)[/dim]")
+        if result["cycles"]:
+            console.print(f"  [yellow]Dependency cycle detected: {', '.join(result['cycles'])}[/yellow]")
+        if result["missing_deps"]:
+            for folder, missing in result["missing_deps"].items():
+                console.print(f"  [yellow]{folder} requires {', '.join(missing)} (not installed)[/yellow]")
 
 
 # track ───────────────────────────────────────────────────────────────────────
@@ -957,13 +1153,81 @@ def check_updates(game):
     console.print(t)
 
 
+# order ───────────────────────────────────────────────────────────────────────
+
+@cli.command("order")
+@click.argument("game")
+@click.option("--dry-run", is_flag=True, help="Preview new order without writing to disk.")
+def order_mods(game, dry_run):
+    """Show and (re)sort the load order file by mod dependency declarations.
+
+    Reads each mod's mod.json, builds a dependency graph, and sorts using a
+    topological sort (Kahn's algorithm). Mods without mod.json keep their
+    relative position. Dependency cycles are detected and placed at the end.
+
+    \b
+    Examples:
+      nexmod order darktide              # sort and write
+      nexmod order darktide --dry-run    # preview only
+    """
+    info = GAMES.get(game)
+    if not info or not info.get("load_order_file"):
+        console.print(f"[yellow]{game} does not use a managed load order file.[/yellow]")
+        return
+
+    db      = get_db()
+    mod_dir = resolve_mod_dir(game, db)
+    lof     = info["load_order_file"]
+
+    if not (mod_dir / lof).exists():
+        console.print(f"[yellow]No {lof} found in {mod_dir}[/yellow]")
+        return
+
+    result  = reorder_load_order(mod_dir, lof, dry_run=dry_run)
+    order   = result["order"]
+    cycles  = set(result["cycles"])
+    dm      = result["deps_map"]
+
+    title = f"Load order — {game}" + (" (dry run, not saved)" if dry_run else "")
+    t = Table(title=title, show_lines=False, box=None, padding=(0, 1))
+    t.add_column("#",       style="dim",   width=4, justify="right")
+    t.add_column("Folder",  style="bold",  min_width=20)
+    t.add_column("Depends on",             style="dim")
+    t.add_column("",        width=8)
+
+    for i, folder in enumerate(order, 1):
+        deps_str  = ", ".join(dm.get(folder, [])) or "—"
+        flag      = "[red]CYCLE[/red]" if folder in cycles else ""
+        t.add_row(str(i), folder, deps_str, flag)
+
+    console.print(t)
+
+    if result["missing_deps"]:
+        console.print("\n[yellow]Missing dependencies (declared but not in load order):[/yellow]")
+        for folder, missing in result["missing_deps"].items():
+            console.print(f"  {folder} → {', '.join(missing)}")
+
+    if cycles:
+        console.print(f"\n[yellow]Dependency cycles ({len(cycles)} mod(s)) placed at end:[/yellow] "
+                      + ", ".join(sorted(cycles)))
+
+    if result["changed"]:
+        if dry_run:
+            console.print("\n[dim]Order would change. Run without --dry-run to apply.[/dim]")
+        else:
+            console.print(f"\n[green]✓ {lof} reordered ({len(order)} mods).[/green]")
+    else:
+        console.print("\n[dim]Order is already correct — no changes needed.[/dim]")
+
+
 # update ──────────────────────────────────────────────────────────────────────
 
 @cli.command("update")
 @click.argument("game")
 @click.option("--mod-id", type=int, default=None, help="Update only this mod ID")
 @click.option("--yes", "-y", is_flag=True, help="Skip confirmation prompts")
-def update_mods(game, mod_id, yes):
+@click.option("--no-reorder", is_flag=True, help="Skip automatic load order sort after update")
+def update_mods(game, mod_id, yes, no_reorder):
     """Download and apply all available updates for GAME."""
     api_key = get_api_key()
     db      = get_db()
@@ -1055,6 +1319,15 @@ def update_mods(game, mod_id, yes):
         updated_count += 1
 
     console.print(f"\n[bold]Done.[/bold] {updated_count} mod(s) updated.")
+
+    info = GAMES.get(game, {})
+    if info.get("load_order_file") and updated_count > 0 and not no_reorder and get_auto_reorder():
+        mod_dir = resolve_mod_dir(game, db)
+        result  = reorder_load_order(mod_dir, info["load_order_file"])
+        if result["changed"]:
+            console.print(f"[dim]Load order sorted ({len(result['order'])} mods)[/dim]")
+        if result["cycles"]:
+            console.print(f"[yellow]Dependency cycle detected: {', '.join(result['cycles'])}[/yellow]")
 
 
 # remove ──────────────────────────────────────────────────────────────────────

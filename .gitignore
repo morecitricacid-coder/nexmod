@@ -5,3 +5,7 @@ __pycache__/
 *.db-shm
 *.db-wal
 .env
+*.egg-info/
+dist/
+build/
+.pytest_cache/

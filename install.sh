@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
+# nexmod installer — uses pip editable install so no path hardcoding.
+# Requires Python 3.10+. Installs into ~/.local/ (no sudo needed).
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-VENV="$SCRIPT_DIR/venv"
 
 # ── Python version check ──────────────────────────────────────────────────────
 PYTHON=$(command -v python3 || true)
@@ -26,39 +27,22 @@ fi
 
 echo "Python $PY_VERSION — OK"
 
-# ── Virtual environment ───────────────────────────────────────────────────────
-echo "Creating venv..."
-"$PYTHON" -m venv "$VENV"
-"$VENV/bin/pip" install -q -r "$SCRIPT_DIR/requirements.txt"
+# ── Install ───────────────────────────────────────────────────────────────────
+echo "Installing nexmod..."
+"$PYTHON" -m pip install -q -e "$SCRIPT_DIR" --user
 
-# ── Wrapper install ───────────────────────────────────────────────────────────
-# Try /usr/local/bin first (system-wide); fall back to ~/.local/bin (no sudo needed).
-if [ -w /usr/local/bin ] || sudo -n true 2>/dev/null; then
-    WRAPPER="/usr/local/bin/nexmod"
-    sudo tee "$WRAPPER" > /dev/null <<EOF
-#!/usr/bin/env bash
-exec "$VENV/bin/python3" "$SCRIPT_DIR/nexmod.py" "\$@"
-EOF
-    sudo chmod +x "$WRAPPER"
+# ── PATH hint ─────────────────────────────────────────────────────────────────
+if ! command -v nexmod &>/dev/null; then
     echo ""
-    echo "nexmod installed → $WRAPPER  (system-wide)"
+    echo "Note: ~/.local/bin is not in your PATH. Add it:"
+    echo "  Bash:  echo 'export PATH=\"\$HOME/.local/bin:\$PATH\"' >> ~/.bashrc && source ~/.bashrc"
+    echo "  Zsh:   echo 'export PATH=\"\$HOME/.local/bin:\$PATH\"' >> ~/.zshrc && source ~/.zshrc"
+    echo "  Fish:  fish_add_path ~/.local/bin"
+    echo ""
+    echo "Then run 'nexmod' to get started."
 else
-    WRAPPER="$HOME/.local/bin/nexmod"
-    mkdir -p "$HOME/.local/bin"
-    cat > "$WRAPPER" <<EOF
-#!/usr/bin/env bash
-exec "$VENV/bin/python3" "$SCRIPT_DIR/nexmod.py" "\$@"
-EOF
-    chmod +x "$WRAPPER"
     echo ""
-    echo "nexmod installed → $WRAPPER  (user-local, no sudo required)"
-    if ! echo "$PATH" | grep -q "$HOME/.local/bin"; then
-        echo ""
-        echo "Note: add ~/.local/bin to your PATH if 'nexmod' isn't found:"
-        echo "  Bash:  echo 'export PATH=\"\$HOME/.local/bin:\$PATH\"' >> ~/.bashrc"
-        echo "  Zsh:   echo 'export PATH=\"\$HOME/.local/bin:\$PATH\"' >> ~/.zshrc"
-        echo "  Fish:  fish_add_path ~/.local/bin"
-    fi
+    echo "nexmod installed → $(command -v nexmod)"
 fi
 
 echo ""

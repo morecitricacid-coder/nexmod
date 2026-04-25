@@ -1,0 +1,50 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nexmod"
+version = "0.2.0"
+description = "Linux-native CLI mod manager for Nexus Mods (requires Premium)"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+keywords = ["nexusmods", "mods", "gaming", "linux", "cli"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Games/Entertainment",
+    "Topic :: Utilities",
+]
+dependencies = [
+    "click>=8.1",
+    "requests>=2.31",
+    "rich>=13.7",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4",
+    "pytest-mock>=3.12",
+    "responses>=0.24",
+]
+
+[project.scripts]
+nexmod = "nexmod:cli"
+
+[project.urls]
+"Bug Tracker" = "https://github.com/YOUR_USERNAME/nexmod/issues"
+"Source" = "https://github.com/YOUR_USERNAME/nexmod"
+
+[tool.setuptools]
+py-modules = ["nexmod"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["smoke: live network tests (skipped by default)"]
