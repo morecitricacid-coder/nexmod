@@ -11,6 +11,7 @@ import zipfile
 import tarfile
 import shutil
 import sys
+import hashlib
 import logging
 import re
 from logging.handlers import RotatingFileHandler
@@ -310,7 +311,11 @@ def find_proton_appdata(steam_id: int) -> Path | None:
 # ── Download & Extract ────────────────────────────────────────────────────────
 
 def download_file(url: str, dest: Path) -> Path:
+    # Atomic: write to <dest>.part, rename on success. A killed/crashed
+    # process never leaves a half-written archive at the canonical path.
     log.debug("Downloading %s → %s", url, dest)
+    part = dest.with_suffix(dest.suffix + ".part")
+    part.unlink(missing_ok=True)
     try:
         with requests.get(url, stream=True, timeout=120) as r:
             r.raise_for_status()
@@ -322,24 +327,43 @@ def download_file(url: str, dest: Path) -> Path:
                 TransferSpeedColumn(),
             ) as progress:
                 task = progress.add_task("dl", filename=dest.name, total=total or None)
-                with open(dest, "wb") as f:
+                with open(part, "wb") as f:
                     for chunk in r.iter_content(chunk_size=65536):
                         f.write(chunk)
                         progress.advance(task, len(chunk))
     except Exception as e:
-        dest.unlink(missing_ok=True)
+        part.unlink(missing_ok=True)
         log.error("Download failed for %s: %s", url, e)
         raise RuntimeError(f"Download failed: {e}") from e
 
-    actual_size = dest.stat().st_size
+    actual_size = part.stat().st_size
     if total and actual_size != total:
-        dest.unlink(missing_ok=True)
+        part.unlink(missing_ok=True)
         msg = f"Size mismatch: expected {total} bytes, got {actual_size}"
         log.error(msg)
         raise RuntimeError(msg)
 
+    part.replace(dest)
     log.debug("Downloaded %s (%d bytes)", dest.name, actual_size)
     return dest
+
+
+def verify_md5(path: Path, expected: str) -> None:
+    # Nexus exposes md5 in files.json. A mismatch means CDN corruption,
+    # truncated download, or a swapped/tampered file — never extract.
+    h = hashlib.md5()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    actual = h.hexdigest().lower()
+    expected_l = (expected or "").lower()
+    if actual != expected_l:
+        path.unlink(missing_ok=True)
+        msg = f"MD5 mismatch: expected {expected_l}, got {actual}"
+        log.error(msg)
+        raise RuntimeError(msg)
+    log.debug("MD5 verified for %s", path.name)
+
 
 def extract_archive(archive: Path, target_dir: Path):
     target_dir.mkdir(parents=True, exist_ok=True)
@@ -748,6 +772,8 @@ def do_install(game: str, mod_id: int, file_id_override: int | None,
     extraction_ok = False
     try:
         download_file(download_url, archive)
+        if chosen.get("md5"):
+            verify_md5(archive, chosen["md5"])
         console.print(f"  Extracting to [dim]{mod_dir}[/dim]...")
         extract_archive(archive, mod_dir)
         extraction_ok = True
@@ -1728,6 +1754,8 @@ def update_mods(game, mod_id, yes, no_reorder):
         extraction_ok = False
         try:
             download_file(download_url, archive)
+            if chosen.get("md5"):
+                verify_md5(archive, chosen["md5"])
             console.print(f"  Extracting to [dim]{mod_dir}[/dim]...")
             extract_archive(archive, mod_dir)
             extraction_ok = True

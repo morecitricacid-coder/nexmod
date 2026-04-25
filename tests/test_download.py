@@ -55,6 +55,63 @@ def test_download_no_content_length_succeeds(tmp_path):
     assert dest.exists()
 
 
+def test_download_writes_via_part_file(tmp_path):
+    # The canonical path must not exist while bytes are streaming. We can't
+    # observe the inflight state easily, but we can confirm there's no
+    # leftover .part file after a successful download.
+    content = b"final bytes"
+    with resp_lib.RequestsMock() as rsps:
+        rsps.add(resp_lib.GET, CDN, body=content,
+                 headers={"content-length": str(len(content))})
+        dest = tmp_path / "mod.zip"
+        nexmod.download_file(CDN, dest)
+
+    assert dest.exists()
+    assert not dest.with_suffix(dest.suffix + ".part").exists()
+
+
+def test_download_failure_leaves_no_partial(tmp_path):
+    # On a size-mismatch failure, neither dest nor dest.part should remain.
+    content = b"short"
+    with resp_lib.RequestsMock() as rsps:
+        rsps.add(resp_lib.GET, CDN, body=content,
+                 headers={"content-length": "99999"})
+        dest = tmp_path / "mod.zip"
+        with pytest.raises(RuntimeError):
+            nexmod.download_file(CDN, dest)
+
+    assert not dest.exists()
+    assert not dest.with_suffix(dest.suffix + ".part").exists()
+
+
+# ── verify_md5 ────────────────────────────────────────────────────────────────
+
+def test_verify_md5_passes_on_match(tmp_path):
+    import hashlib
+    archive = tmp_path / "mod.zip"
+    archive.write_bytes(b"some payload")
+    expected = hashlib.md5(b"some payload").hexdigest()
+    nexmod.verify_md5(archive, expected)  # must not raise
+    assert archive.exists()
+
+
+def test_verify_md5_raises_on_mismatch_and_unlinks(tmp_path):
+    archive = tmp_path / "mod.zip"
+    archive.write_bytes(b"some payload")
+    with pytest.raises(RuntimeError, match="MD5 mismatch"):
+        nexmod.verify_md5(archive, "0" * 32)
+    # File is unlinked so a stale archive can't be reused on retry.
+    assert not archive.exists()
+
+
+def test_verify_md5_is_case_insensitive(tmp_path):
+    import hashlib
+    archive = tmp_path / "mod.zip"
+    archive.write_bytes(b"payload")
+    expected = hashlib.md5(b"payload").hexdigest().upper()  # API may give upper-case
+    nexmod.verify_md5(archive, expected)  # must not raise
+
+
 # ── extract_archive — zip ─────────────────────────────────────────────────────
 
 def make_zip(path: Path, members: dict) -> None:
