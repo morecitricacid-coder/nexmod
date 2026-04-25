@@ -1631,6 +1631,72 @@ def list_mods(game):
     console.print(t)
 
 
+# info ────────────────────────────────────────────────────────────────────────
+
+@cli.command("info")
+@click.argument("game")
+@click.argument("mod_id", type=int)
+def show_mod_info(game, mod_id):
+    """Show detailed info for a tracked mod (local DB + one Nexus lookup).
+
+    \b
+    Example:
+      nexmod info darktide 1234
+    """
+    db  = get_db()
+    row = db.execute(
+        "SELECT * FROM mods WHERE game=? AND mod_id=?", (game, mod_id)
+    ).fetchone()
+    if not row:
+        console.print(f"[red]Mod {mod_id} is not tracked for '{game}'.[/red]")
+        console.print(f"[dim]Run 'nexmod track {game} {mod_id}' first.[/dim]")
+        sys.exit(1)
+
+    api_key = get_api_key()
+    info    = GAMES.get(game, {})
+    domain  = info.get("domain", game)
+
+    with console.status(f"Fetching {row['name']} from Nexus..."):
+        try:
+            upstream = api_mod_info(domain, mod_id, api_key)
+        except Exception as e:
+            log.error("info: api_mod_info failed for %s/%s: %s", game, mod_id, e)
+            upstream = {}
+            console.print(f"[yellow]Could not fetch upstream info: {e}[/yellow]")
+
+    folder_name = _archive_basename(row["filename"]) if row["filename"] else None
+
+    t = Table(title=f"Mod info — {row['name']}", show_lines=False, box=None, padding=(0, 1))
+    t.add_column("Field", style="dim")
+    t.add_column("Value")
+
+    t.add_row("Game",          game)
+    t.add_row("Mod ID",        str(row["mod_id"]))
+    t.add_row("Name",          row["name"])
+    if upstream.get("author"):
+        t.add_row("Author",    upstream["author"])
+    t.add_row("Installed",     row["version"] or "—")
+    if upstream.get("version"):
+        latest = upstream["version"]
+        if row["version"] and row["version"] != latest:
+            t.add_row("Latest", f"[yellow]{latest}  (update available)[/yellow]")
+        else:
+            t.add_row("Latest", latest)
+    t.add_row("File ID",       str(row["file_id"]) if row["file_id"] else "—")
+    t.add_row("Filename",      row["filename"] or "—")
+    t.add_row("Folder",        folder_name or "—")
+    t.add_row("Mod dir",       row["mod_dir"] or "—")
+    t.add_row("Tracked at",    (row["tracked_at"] or "")[:19].replace("T", " "))
+    t.add_row("Last updated",  (row["updated_at"] or "—")[:19].replace("T", " "))
+
+    console.print(t)
+
+    if folder_name and row["mod_dir"]:
+        deps = _parse_mod_deps(Path(row["mod_dir"]), folder_name)
+        if deps:
+            console.print(f"\n[bold]Declared dependencies:[/bold] {', '.join(deps)}")
+
+
 # check ───────────────────────────────────────────────────────────────────────
 
 @cli.command("check")
