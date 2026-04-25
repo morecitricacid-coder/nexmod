@@ -394,7 +394,16 @@ def pick_main_file(files: list) -> dict | None:
             if cat == category:
                 return f
     valid = [f for f in files if "OLD_VERSION" not in (f.get("category_name") or "").upper()]
-    return max(valid, key=lambda f: f.get("uploaded_timestamp", 0)) if valid else None
+    if not valid:
+        return None
+    chosen = max(valid, key=lambda f: f.get("uploaded_timestamp", 0))
+    console.print(
+        "[yellow]No MAIN/UPDATE/MISCELLANEOUS file — falling back to most recent: "
+        f"{chosen.get('file_name', '?')} ({chosen.get('category_name', '?')})[/yellow]"
+    )
+    log.warning("pick_main_file fallback: chose file_id=%s category=%s",
+                chosen.get("file_id"), chosen.get("category_name"))
+    return chosen
 
 
 # ── Nexus URL Parser ─────────────────────────────────────────────────────────
@@ -575,7 +584,7 @@ def reorder_load_order(
     lines = lof.read_text().splitlines()
     # Strip all comment lines — nexmod writes its own header on every save.
     folder_lines = [l.strip() for l in lines if l.strip() and not l.strip().startswith("--")]
-    header_comments = ["-- File managed by nexmod (https://github.com/YOUR_USERNAME/nexmod)"]
+    header_comments = ["-- File managed by nexmod"]
 
     original = folder_lines
     if not original:
@@ -852,7 +861,7 @@ def _list_profiles(game: str) -> list[dict]:
 def _apply_profile(mod_dir: Path, load_order_file: str, load_order: list[str]):
     """Write a profile's load order list to mod_load_order.txt."""
     lof = mod_dir / load_order_file
-    header = ["-- File managed by nexmod (https://github.com/YOUR_USERNAME/nexmod)"]
+    header = ["-- File managed by nexmod"]
     lof.write_text("\n".join(header + load_order) + "\n")
 
 
@@ -924,6 +933,7 @@ def config_verify():
     except Exception as e:
         log.error("API verify failed: %s", e)
         console.print(f"[red]API error: {e}[/red]")
+        sys.exit(1)
 
 @config.command("auto-reorder")
 @click.argument("state", type=click.Choice(["on", "off"], case_sensitive=False))

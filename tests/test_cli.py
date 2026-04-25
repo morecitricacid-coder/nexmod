@@ -84,6 +84,18 @@ def test_config_verify_no_premium_warns(runner, api_key_config):
     assert "NO" in result.output or "Warning" in result.output
 
 
+def test_config_verify_exits_on_api_error(runner, api_key_config, monkeypatch):
+    # When the API call itself raises (network down, malformed response, etc.),
+    # `nexmod config verify` must exit non-zero so shell scripts and CI checks
+    # can detect the failure. Previously it printed an error and exited 0.
+    def boom(endpoint, api_key):
+        raise RuntimeError("simulated API failure")
+    monkeypatch.setattr(nexmod, "nexus_get", boom)
+    result = runner.invoke(cli, ["config", "verify"])
+    assert result.exit_code == 1
+    assert "API error" in result.output
+
+
 # ── nexmod list ───────────────────────────────────────────────────────────────
 
 def test_list_empty_game(runner):
