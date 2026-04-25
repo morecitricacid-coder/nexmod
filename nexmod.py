@@ -1053,5 +1053,105 @@ def remove_mod(game, mod_id, purge):
     console.print(f"[green]Removed:[/green] {row['name']}")
 
 
+# enable / disable / toggle ───────────────────────────────────────────────────
+
+WINE_PREFIX = DATA_DIR / "wine-prefix"
+
+def _find_dtkit(game_dir: Path) -> Path | None:
+    for name in ("dtkit-patch.exe", "dtkit-patch"):
+        p = game_dir / "tools" / name
+        if p.exists():
+            return p
+    return None
+
+def _run_dtkit(game_dir: Path, action: str) -> tuple[bool, str]:
+    """Run dtkit-patch via Wine. action: --patch | --unpatch | --toggle"""
+    dtkit = _find_dtkit(game_dir)
+    if not dtkit:
+        return False, f"dtkit-patch.exe not found in {game_dir}/tools/"
+
+    bundle_win = f"Z:{game_dir}/bundle"
+    env = {
+        **__import__("os").environ,
+        "WINEPREFIX": str(WINE_PREFIX),
+        "WINEDEBUG": "-all",
+    }
+    import subprocess
+    result = subprocess.run(
+        ["wine", str(dtkit), action, bundle_win],
+        capture_output=True, text=True, env=env,
+    )
+    output = (result.stdout + result.stderr).strip()
+    # filter radv noise
+    clean = "\n".join(l for l in output.splitlines() if "radv" not in l.lower())
+    log.debug("dtkit exit=%s output=%r", result.returncode, clean)
+    return result.returncode == 0, clean
+
+def _dtkit_status(game_dir: Path) -> str | None:
+    """Return 'patched' or 'unpatched' by inspecting the bundle_database.data header."""
+    db_file = game_dir / "bundle" / "bundle_database.data"
+    if not db_file.exists():
+        return None
+    # dtkit writes a recognisable signature when patched
+    with open(db_file, "rb") as f:
+        header = f.read(64)
+    # The mod entry bundle presence is indicated by a known string in the header area
+    return "patched" if b"mod_main" in header or b"mods" in header else "unpatched"
+
+@cli.command("enable")
+@click.argument("game")
+def enable_mods(game):
+    """Patch the game bundle to enable mod loading (runs dtkit-patch via Wine)."""
+    db       = get_db()
+    mod_dir  = resolve_mod_dir(game, db)
+    game_dir = mod_dir.parent
+    console.print(f"Enabling mods for [bold]{game}[/bold]...")
+    ok, output = _run_dtkit(game_dir, "--patch")
+    if output:
+        console.print(f"[dim]{output}[/dim]")
+    if ok or "already" in output.lower() or "patched" in output.lower():
+        log.info("Mods enabled for %s", game)
+        console.print("[green]✓ Mods enabled. Launch the game and they should load.[/green]")
+    else:
+        log.error("dtkit-patch failed: %s", output)
+        console.print(f"[red]✗ Failed.[/red]")
+
+@cli.command("disable")
+@click.argument("game")
+def disable_mods(game):
+    """Unpatch the game bundle to disable mod loading."""
+    db       = get_db()
+    mod_dir  = resolve_mod_dir(game, db)
+    game_dir = mod_dir.parent
+    console.print(f"Disabling mods for [bold]{game}[/bold]...")
+    ok, output = _run_dtkit(game_dir, "--unpatch")
+    if output:
+        console.print(f"[dim]{output}[/dim]")
+    if ok or "unpatch" in output.lower():
+        log.info("Mods disabled for %s", game)
+        console.print("[green]✓ Mods disabled.[/green]")
+    else:
+        log.error("dtkit-patch failed: %s", output)
+        console.print(f"[red]✗ Failed.[/red]")
+
+@cli.command("toggle")
+@click.argument("game")
+def toggle_mods(game):
+    """Toggle mod loading on/off (patch ↔ unpatch)."""
+    db       = get_db()
+    mod_dir  = resolve_mod_dir(game, db)
+    game_dir = mod_dir.parent
+    console.print(f"Toggling mods for [bold]{game}[/bold]...")
+    ok, output = _run_dtkit(game_dir, "--toggle")
+    if output:
+        console.print(f"[dim]{output}[/dim]")
+    if ok:
+        log.info("Mods toggled for %s: %s", game, output)
+        console.print("[green]✓ Done.[/green]")
+    else:
+        log.error("dtkit-patch toggle failed: %s", output)
+        console.print(f"[red]✗ Failed.[/red]")
+
+
 if __name__ == "__main__":
     cli()
