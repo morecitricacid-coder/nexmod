@@ -1816,8 +1816,14 @@ def order_mods(game, dry_run):
 @click.option("--mod-id", type=int, default=None, help="Update only this mod ID")
 @click.option("--yes", "-y", is_flag=True, help="Skip confirmation prompts")
 @click.option("--no-reorder", is_flag=True, help="Skip automatic load order sort after update")
-def update_mods(game, mod_id, yes, no_reorder):
-    """Download and apply all available updates for GAME."""
+@click.option("--fix-deps", is_flag=True, help="Interactively install any missing dependencies surfaced after the update scan (default: report only).")
+def update_mods(game, mod_id, yes, no_reorder, fix_deps):
+    """Download and apply all available updates for GAME.
+
+    Always scans for missing dependencies after the update pass — even when
+    no mods needed updating. By default, missing deps are reported only;
+    pass --fix-deps to be prompted to install each one.
+    """
     api_key = get_api_key()
     db      = get_db()
 
@@ -1911,8 +1917,11 @@ def update_mods(game, mod_id, yes, no_reorder):
 
     console.print(f"\n[bold]Done.[/bold] {updated_count} mod(s) updated.")
 
+    # Always run the dep/order scan — even when nothing updated. Missing deps
+    # are silent rot when this only fired on updated_count > 0; users would
+    # eventually get told only when something else triggered an install.
     info = GAMES.get(game, {})
-    if info.get("load_order_file") and updated_count > 0 and not no_reorder and get_auto_reorder():
+    if info.get("load_order_file") and not no_reorder and get_auto_reorder():
         mod_dir = resolve_mod_dir(game, db)
         lof     = info["load_order_file"]
         result  = reorder_load_order(mod_dir, lof)
@@ -1921,11 +1930,23 @@ def update_mods(game, mod_id, yes, no_reorder):
         if result["cycles"]:
             console.print(f"[yellow]Dependency cycle detected: {', '.join(result['cycles'])}[/yellow]")
         if result["missing_deps"]:
-            newly = _handle_missing_deps(game, result["missing_deps"], mod_dir, api_key, db)
-            if newly:
-                result2 = reorder_load_order(mod_dir, lof)
-                if result2["changed"]:
-                    console.print(f"[dim]Load order re-sorted after dependency install[/dim]")
+            if fix_deps:
+                newly = _handle_missing_deps(game, result["missing_deps"], mod_dir, api_key, db)
+                if newly:
+                    result2 = reorder_load_order(mod_dir, lof)
+                    if result2["changed"]:
+                        console.print(f"[dim]Load order re-sorted after dependency install[/dim]")
+            else:
+                n_mods = len(result["missing_deps"])
+                n_deps = sum(len(d) for d in result["missing_deps"].values())
+                console.print(
+                    f"\n[yellow]⚠ {n_mods} mod(s) missing {n_deps} dependency(ies):[/yellow]"
+                )
+                for declaring, deps in result["missing_deps"].items():
+                    console.print(f"  [yellow]{declaring}[/yellow] → {', '.join(deps)}")
+                console.print(
+                    f"  [dim]Re-run with [cyan]--fix-deps[/cyan] to install them interactively.[/dim]"
+                )
 
 
 # remove ──────────────────────────────────────────────────────────────────────
