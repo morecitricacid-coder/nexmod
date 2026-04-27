@@ -1,0 +1,766 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>nexmod — Nexus Mods manager for Linux</title>
+<meta name="description" content="A Linux CLI mod manager for Nexus Mods. Install, update, and manage mods from the terminal. Tested on Darktide. Premium required.">
+<meta property="og:title" content="nexmod — Nexus Mods manager for Linux">
+<meta property="og:description" content="Install, update, and hotswap mod profiles from the terminal. No Wine-wrapped GUI.">
+<meta property="og:type" content="website">
+<style>
+:root {
+  --bg:          #0b0b0d;
+  --surface:     #111116;
+  --surface2:    #16161e;
+  --border:      #1e1e2a;
+  --border2:     #2a2a38;
+  --accent:      #f59e0b;
+  --accent-glow: rgba(245,158,11,0.12);
+  --text:        #e2e2e9;
+  --muted:       #71717a;
+  --dim:         #3f3f46;
+  --green:       #4ade80;
+  --green-glow:  rgba(74,222,128,0.12);
+  --green-border:rgba(74,222,128,0.25);
+  --amber-text:  #fcd34d;
+  --t-bg:        #08080e;
+  --t-prompt:    #f59e0b;
+  --t-out:       #8b8ba7;
+  --t-ok:        #4ade80;
+  --t-hi:        #e2e2e9;
+  --t-dim:       #3f3f52;
+}
+
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+html{scroll-behavior:smooth;-webkit-font-smoothing:antialiased}
+
+body{
+  font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',system-ui,sans-serif;
+  background:var(--bg);
+  color:var(--text);
+  line-height:1.6;
+  min-height:100vh;
+}
+
+/* Subtle grid */
+body::before{
+  content:'';
+  position:fixed;inset:0;
+  background-image:
+    linear-gradient(rgba(245,158,11,0.025) 1px,transparent 1px),
+    linear-gradient(90deg,rgba(245,158,11,0.025) 1px,transparent 1px);
+  background-size:64px 64px;
+  pointer-events:none;
+  z-index:0;
+}
+
+.wrap{max-width:980px;margin:0 auto;padding:0 24px;position:relative;z-index:1}
+
+/* ── NAV ─────────────────────────────────────────────────── */
+nav{
+  position:sticky;top:0;z-index:200;
+  border-bottom:1px solid var(--border);
+  background:rgba(11,11,13,0.88);
+  backdrop-filter:blur(16px);
+  -webkit-backdrop-filter:blur(16px);
+}
+.nav-inner{
+  display:flex;align-items:center;justify-content:space-between;
+  padding:14px 0;
+}
+.nav-logo{
+  font-family:'JetBrains Mono','Fira Code','Cascadia Code',monospace;
+  font-size:1.05rem;font-weight:700;
+  color:var(--accent);text-decoration:none;
+  letter-spacing:-0.02em;
+}
+.nav-links{display:flex;gap:28px;list-style:none}
+.nav-links a{
+  color:var(--muted);text-decoration:none;
+  font-size:0.875rem;transition:color 0.15s;
+}
+.nav-links a:hover{color:var(--text)}
+.nav-cta{
+  display:flex;align-items:center;gap:8px;
+  background:var(--accent-glow);
+  border:1px solid rgba(245,158,11,0.3);
+  color:var(--accent);
+  font-size:0.8rem;font-weight:600;
+  padding:6px 14px;border-radius:7px;
+  text-decoration:none;transition:all 0.15s;
+}
+.nav-cta:hover{background:rgba(245,158,11,0.2);border-color:rgba(245,158,11,0.5)}
+
+/* ── HERO ────────────────────────────────────────────────── */
+.hero{
+  padding:88px 0 72px;
+  display:grid;
+  grid-template-columns:1fr 1fr;
+  gap:56px;align-items:center;
+}
+.hero-eyebrow{
+  display:inline-flex;align-items:center;gap:8px;
+  font-size:0.72rem;font-weight:600;
+  color:var(--accent);letter-spacing:0.1em;text-transform:uppercase;
+  background:var(--accent-glow);
+  border:1px solid rgba(245,158,11,0.25);
+  padding:4px 12px;border-radius:20px;
+  margin-bottom:20px;
+}
+.hero-eyebrow-dot{width:5px;height:5px;border-radius:50%;background:var(--accent)}
+.hero h1{
+  font-family:'JetBrains Mono','Fira Code',monospace;
+  font-size:4rem;font-weight:800;
+  color:var(--accent);
+  letter-spacing:-0.05em;line-height:0.95;
+  margin-bottom:20px;
+}
+.hero-tagline{
+  font-size:1.2rem;color:var(--text);
+  line-height:1.55;margin-bottom:8px;
+}
+.hero-sub{
+  font-size:0.875rem;color:var(--muted);
+  margin-bottom:36px;line-height:1.6;
+}
+.install-box{
+  display:flex;align-items:center;justify-content:space-between;
+  background:var(--surface);
+  border:1px solid var(--border2);
+  border-radius:10px;padding:14px 18px;
+  gap:16px;margin-bottom:22px;
+  font-family:'JetBrains Mono','Fira Code',monospace;
+}
+.install-prompt{color:var(--dim)}
+.install-cmd{
+  font-size:0.88rem;color:var(--text);
+  flex:1;
+}
+.copy-btn{
+  background:none;border:1px solid var(--border2);
+  color:var(--muted);padding:5px 13px;
+  border-radius:6px;font-size:0.72rem;
+  cursor:pointer;transition:all 0.15s;white-space:nowrap;
+}
+.copy-btn:hover{border-color:var(--accent);color:var(--accent)}
+.hero-links{display:flex;gap:10px;flex-wrap:wrap}
+.pill{
+  display:inline-flex;align-items:center;gap:6px;
+  background:var(--surface);
+  border:1px solid var(--border);
+  color:var(--muted);
+  font-size:0.75rem;padding:5px 13px;
+  border-radius:7px;text-decoration:none;
+  transition:all 0.15s;
+}
+.pill:hover{border-color:var(--border2);color:var(--text)}
+.pill-live::before{
+  content:'';width:6px;height:6px;border-radius:50%;
+  background:var(--green);
+  box-shadow:0 0 6px var(--green);
+}
+
+/* ── TERMINAL ────────────────────────────────────────────── */
+.terminal{
+  background:var(--t-bg);
+  border:1px solid var(--border);
+  border-radius:14px;overflow:hidden;
+  font-family:'JetBrains Mono','Fira Code','Consolas',monospace;
+  font-size:0.775rem;line-height:1.75;
+  box-shadow:0 24px 64px rgba(0,0,0,0.5);
+}
+.term-bar{
+  background:var(--surface);padding:11px 16px;
+  display:flex;align-items:center;gap:7px;
+  border-bottom:1px solid var(--border);
+}
+.dot{width:11px;height:11px;border-radius:50%}
+.dot-r{background:#ff5f57}.dot-y{background:#ffbd2e}.dot-g{background:#28c840}
+.term-label{
+  margin-left:8px;font-size:0.7rem;color:var(--muted);
+}
+.term-body{
+  padding:20px 22px 22px;
+  height:310px;overflow-y:auto;
+}
+.term-body::-webkit-scrollbar{width:4px}
+.term-body::-webkit-scrollbar-thumb{background:var(--border2);border-radius:4px}
+.t-line{display:block}
+.t-blank{display:block;height:0.5em}
+.tp{color:var(--t-prompt)}
+.tc{color:var(--t-hi)}
+.tok{color:var(--t-ok)}
+.tout{color:var(--t-out)}
+.tdim{color:var(--t-dim)}
+.tamb{color:var(--amber-text)}
+.cursor{
+  display:inline-block;width:7px;height:0.95em;
+  background:var(--accent);vertical-align:text-bottom;
+  margin-left:1px;
+  animation:blink 1.1s step-end infinite;
+}
+@keyframes blink{0%,100%{opacity:1}50%{opacity:0}}
+
+/* ── SECTIONS ────────────────────────────────────────────── */
+.section{padding:80px 0;border-top:1px solid var(--border)}
+.sec-label{
+  font-size:0.7rem;font-weight:700;
+  color:var(--accent);text-transform:uppercase;
+  letter-spacing:0.12em;margin-bottom:14px;
+}
+.sec-title{
+  font-size:2rem;font-weight:700;
+  line-height:1.2;margin-bottom:14px;
+}
+.sec-sub{
+  color:var(--muted);font-size:0.95rem;
+  max-width:580px;margin-bottom:44px;line-height:1.65;
+}
+
+/* ── FEATURES ────────────────────────────────────────────── */
+.feat-grid{
+  display:grid;
+  grid-template-columns:repeat(2,1fr);
+  gap:16px;
+}
+.feat{
+  background:var(--surface);
+  border:1px solid var(--border);
+  border-radius:12px;padding:26px 28px;
+  transition:border-color 0.2s,background 0.2s;
+}
+.feat:hover{
+  border-color:rgba(245,158,11,0.3);
+  background:var(--surface2);
+}
+.feat-icon{
+  font-size:1.3rem;margin-bottom:14px;display:block;
+  line-height:1;
+}
+.feat-title{
+  font-size:0.95rem;font-weight:700;
+  color:var(--text);margin-bottom:10px;
+}
+.feat-desc{
+  font-size:0.85rem;color:var(--muted);
+  line-height:1.65;
+}
+.feat-tags{
+  display:flex;flex-wrap:wrap;gap:5px;
+  margin-top:16px;
+}
+.ftag{
+  font-family:'JetBrains Mono','Fira Code',monospace;
+  font-size:0.68rem;
+  background:rgba(255,255,255,0.04);
+  border:1px solid var(--border);
+  color:var(--muted);
+  padding:2px 8px;border-radius:4px;
+}
+
+/* ── COMPATIBILITY ───────────────────────────────────────── */
+.compat-table{display:grid;gap:10px}
+.compat-row{
+  background:var(--surface);
+  border:1px solid var(--border);
+  border-radius:10px;padding:17px 22px;
+  display:grid;
+  grid-template-columns:200px 130px 1fr;
+  align-items:center;gap:14px;
+  transition:border-color 0.15s;
+}
+.compat-row.v{
+  border-color:var(--green-border);
+  background:var(--green-glow);
+}
+.compat-game{font-weight:600;font-size:0.9rem}
+.cbadge{
+  display:inline-flex;align-items:center;gap:5px;
+  font-size:0.72rem;font-weight:700;
+  padding:3px 10px;border-radius:6px;
+  width:fit-content;
+}
+.bv{
+  background:var(--green-glow);
+  color:var(--green);
+  border:1px solid var(--green-border);
+}
+.bu{
+  background:rgba(113,113,122,0.08);
+  color:var(--muted);
+  border:1px solid var(--border);
+}
+.compat-note{font-size:0.8rem;color:var(--muted);line-height:1.5}
+.compat-note code{
+  font-family:monospace;font-size:0.78rem;
+  background:rgba(255,255,255,0.05);
+  padding:1px 5px;border-radius:3px;
+}
+.compat-cta{
+  margin-top:18px;
+  padding:15px 20px;
+  background:var(--surface);
+  border:1px solid var(--border);
+  border-radius:8px;
+  font-size:0.82rem;color:var(--muted);
+  line-height:1.6;
+}
+.compat-cta a{color:var(--accent);text-decoration:none}
+.compat-cta a:hover{text-decoration:underline}
+
+/* ── QUICKSTART ──────────────────────────────────────────── */
+.code-block{
+  background:var(--t-bg);
+  border:1px solid var(--border);
+  border-radius:12px;padding:24px 26px;
+  font-family:'JetBrains Mono','Fira Code',monospace;
+  font-size:0.82rem;line-height:2;
+  overflow-x:auto;
+}
+.cl{display:block}
+.cc{color:var(--dim)}
+.cpr{color:var(--accent)}
+.ccm{color:var(--text)}
+.carg{color:var(--amber-text)}
+
+/* ── REQUIREMENTS STRIP ─────────────────────────────────── */
+.req-strip{
+  display:flex;gap:12px;flex-wrap:wrap;
+  margin-top:40px;
+}
+.req{
+  display:flex;align-items:center;gap:8px;
+  background:var(--surface);
+  border:1px solid var(--border);
+  border-radius:8px;
+  padding:10px 16px;
+  font-size:0.8rem;
+}
+.req-icon{font-size:1rem}
+.req-label{color:var(--muted)}
+.req-val{color:var(--text);font-weight:600}
+
+/* ── FOOTER ──────────────────────────────────────────────── */
+footer{
+  border-top:1px solid var(--border);
+  padding:36px 0;
+  margin-top:24px;
+}
+.footer-inner{
+  display:flex;align-items:center;
+  justify-content:space-between;gap:16px;
+}
+.footer-logo{
+  font-family:monospace;font-size:0.9rem;
+  font-weight:700;color:var(--accent);
+}
+.footer-note{font-size:0.75rem;color:var(--dim);margin-top:4px}
+.footer-links{
+  display:flex;gap:22px;
+  font-size:0.8rem;color:var(--muted);
+}
+.footer-links a{
+  color:var(--muted);text-decoration:none;
+  transition:color 0.15s;
+}
+.footer-links a:hover{color:var(--text)}
+
+/* ── RESPONSIVE ──────────────────────────────────────────── */
+@media(max-width:760px){
+  .hero{
+    grid-template-columns:1fr;
+    gap:40px;padding:60px 0 48px;
+  }
+  .hero h1{font-size:3rem}
+  .feat-grid{grid-template-columns:1fr}
+  .compat-row{
+    grid-template-columns:1fr auto;
+    grid-template-rows:auto auto;
+  }
+  .compat-note{grid-column:1/-1}
+  .footer-inner{flex-direction:column;text-align:center}
+  .footer-links{flex-wrap:wrap;justify-content:center}
+  .nav-links{display:none}
+}
+</style>
+</head>
+<body>
+
+<!-- NAV -->
+<nav>
+  <div class="wrap nav-inner">
+    <a class="nav-logo" href="#">nexmod</a>
+    <ul class="nav-links">
+      <li><a href="#features">Features</a></li>
+      <li><a href="#compatibility">Compatibility</a></li>
+      <li><a href="#quickstart">Quick start</a></li>
+    </ul>
+    <a class="nav-cta" href="https://github.com/morecitricacid-coder/nexmod">
+      <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor">
+        <path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/>
+      </svg>
+      GitHub
+    </a>
+  </div>
+</nav>
+
+<main>
+<div class="wrap">
+
+<!-- HERO -->
+<section class="hero">
+  <div class="hero-text">
+    <div class="hero-eyebrow">
+      <span class="hero-eyebrow-dot"></span>
+      Linux CLI · Nexus Premium
+    </div>
+    <h1>nexmod</h1>
+    <p class="hero-tagline">Nexus Mods management for Linux, done in the terminal.</p>
+    <p class="hero-sub">
+      Install, update, and hotswap mod profiles — no Wine-wrapped GUI, no background daemon,
+      no telemetry. Just a fast CLI and a local SQLite state store.
+    </p>
+
+    <div class="install-box">
+      <span style="color:var(--dim);font-size:0.88rem">$</span>
+      <span class="install-cmd">pipx install nexmod</span>
+      <button class="copy-btn" onclick="copyCmd(this,'pipx install nexmod')">Copy</button>
+    </div>
+
+    <div class="hero-links">
+      <a href="https://pypi.org/project/nexmod/" class="pill pill-live">v0.3.0 · PyPI</a>
+      <a href="https://github.com/morecitricacid-coder/nexmod/actions/workflows/ci.yml" class="pill">CI passing</a>
+      <span class="pill">MIT</span>
+      <span class="pill">Python 3.10+</span>
+    </div>
+  </div>
+
+  <!-- TERMINAL DEMO -->
+  <div class="terminal">
+    <div class="term-bar">
+      <span class="dot dot-r"></span>
+      <span class="dot dot-y"></span>
+      <span class="dot dot-g"></span>
+      <span class="term-label">bash — nexmod</span>
+    </div>
+    <div class="term-body" id="tb">
+      <span class="cursor" id="cur"></span>
+    </div>
+  </div>
+</section>
+
+<!-- FEATURES -->
+<section class="section" id="features">
+  <p class="sec-label">Features</p>
+  <h2 class="sec-title">Everything a mod manager should do.</h2>
+  <p class="sec-sub">
+    No GUI wrapper. Auditable state in a local SQLite DB. Every operation is atomic —
+    the DB is never written unless extraction completes.
+  </p>
+
+  <div class="feat-grid">
+    <div class="feat">
+      <span class="feat-icon">↓</span>
+      <div class="feat-title">Install &amp; track</div>
+      <div class="feat-desc">
+        Paste a full Nexus URL or pass a game slug + mod ID. Atomic download with MD5 verification
+        before extraction. Supports .zip, .tar.gz, .7z. Detects conflicts before touching disk.
+      </div>
+      <div class="feat-tags">
+        <span class="ftag">nexmod install darktide 1234</span>
+        <span class="ftag">nexmod install &lt;nexus-url&gt;</span>
+        <span class="ftag">--dry-run</span>
+      </div>
+    </div>
+
+    <div class="feat">
+      <span class="feat-icon">⇅</span>
+      <div class="feat-title">Load order management</div>
+      <div class="feat-desc">
+        Reads <code style="font-family:monospace;font-size:0.82em">mod.json</code> and
+        <code style="font-family:monospace;font-size:0.82em">.mod</code> files
+        for declared dependencies, then sorts topologically. Cycles are surfaced,
+        not silently buried at the end of the file.
+      </div>
+      <div class="feat-tags">
+        <span class="ftag">nexmod order darktide</span>
+        <span class="ftag">--dry-run</span>
+        <span class="ftag">cycle detection</span>
+      </div>
+    </div>
+
+    <div class="feat">
+      <span class="feat-icon">⇄</span>
+      <div class="feat-title">Profile hotswap</div>
+      <div class="feat-desc">
+        Snapshot the current load order as a named profile. Load it back in one command —
+        including automatically installing any mods missing from that profile.
+        Useful for separating a stable set from an experimental one.
+      </div>
+      <div class="feat-tags">
+        <span class="ftag">nexmod profile save darktide stable</span>
+        <span class="ftag">nexmod profile load darktide stable</span>
+        <span class="ftag">--install</span>
+      </div>
+    </div>
+
+    <div class="feat">
+      <span class="feat-icon">◈</span>
+      <div class="feat-title">Safety net</div>
+      <div class="feat-desc">
+        <code style="font-family:monospace;font-size:0.82em">doctor</code> checks your whole
+        environment before you touch anything.
+        <code style="font-family:monospace;font-size:0.82em">rollback</code> restores from
+        auto-saved version snapshots.
+        <code style="font-family:monospace;font-size:0.82em">fsck</code> audits the local DB.
+        Dep scan runs on every update so gaps can't silently accumulate.
+      </div>
+      <div class="feat-tags">
+        <span class="ftag">nexmod doctor</span>
+        <span class="ftag">nexmod rollback darktide 1234</span>
+        <span class="ftag">nexmod fsck --fix</span>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- COMPATIBILITY -->
+<section class="section" id="compatibility">
+  <p class="sec-label">Compatibility</p>
+  <h2 class="sec-title">Honest about what's tested.</h2>
+  <p class="sec-sub">
+    nexmod was built for Darktide and is used there daily. The install/update pipeline is wired
+    for other games, but they haven't been tested in the wild yet.
+  </p>
+
+  <div class="compat-table">
+    <div class="compat-row v">
+      <span class="compat-game">Darktide</span>
+      <span class="cbadge bv">✓ Verified</span>
+      <span class="compat-note">
+        Daily driver. Load order, NXM handler, missing-dep detection, rollback snapshots,
+        enable/disable patch — all battle-tested.
+      </span>
+    </div>
+    <div class="compat-row">
+      <span class="compat-game">Skyrim SE</span>
+      <span class="cbadge bu">⊘ Untested</span>
+      <span class="compat-note">
+        Install/update pipeline is wired. Load order sorting uses a different system than
+        Darktide — not implemented. Needs community verification.
+      </span>
+    </div>
+    <div class="compat-row">
+      <span class="compat-game">Baldur's Gate 3</span>
+      <span class="cbadge bu">⊘ Untested</span>
+      <span class="compat-note">
+        Install/update pipeline wired. Needs someone to put it through real use and report back.
+      </span>
+    </div>
+    <div class="compat-row">
+      <span class="compat-game">Cyberpunk 2077</span>
+      <span class="cbadge bu">⊘ Untested</span>
+      <span class="compat-note">
+        Install/update pipeline wired. Needs community testing.
+      </span>
+    </div>
+    <div class="compat-row">
+      <span class="compat-game">Fallout 4</span>
+      <span class="cbadge bu">⊘ Untested</span>
+      <span class="compat-note">
+        Install/update pipeline wired. Needs community testing.
+      </span>
+    </div>
+    <div class="compat-row">
+      <span class="compat-game">Other games</span>
+      <span class="cbadge bu">⊘ Untested</span>
+      <span class="compat-note">
+        Any Nexus domain works for download/extract. Set the mod directory manually with
+        <code>nexmod path set &lt;game&gt; &lt;dir&gt;</code> and it'll use the standard pipeline.
+      </span>
+    </div>
+  </div>
+
+  <div class="compat-cta">
+    <strong style="color:var(--text)">Help expand the verified list.</strong>
+    Tested nexmod on a game not listed above?
+    <a href="https://github.com/morecitricacid-coder/nexmod/issues/new?template=bug_report.md">
+      Open an issue
+    </a>
+    with your experience and what worked (or didn't), and we'll update the table.
+  </div>
+</section>
+
+<!-- QUICK START -->
+<section class="section" id="quickstart">
+  <p class="sec-label">Quick start</p>
+  <h2 class="sec-title">Up in four steps.</h2>
+  <p class="sec-sub">
+    Requires a <strong style="color:var(--text)">Nexus Mods Premium</strong> account —
+    the fast-download API is Premium-only.
+  </p>
+
+  <div class="code-block">
+    <span class="cl"><span class="cc"># 1. Install</span></span>
+    <span class="cl"><span class="cpr">$ </span><span class="ccm">pipx install </span><span class="carg">nexmod</span></span>
+    <span class="cl"> </span>
+    <span class="cl"><span class="cc"># 2. Add your API key  (nexusmods.com → avatar → Settings → API Keys)</span></span>
+    <span class="cl"><span class="cpr">$ </span><span class="ccm">nexmod config set-key </span><span class="carg">&lt;your-key&gt;</span></span>
+    <span class="cl"> </span>
+    <span class="cl"><span class="cc"># 3. Verify everything's wired up</span></span>
+    <span class="cl"><span class="cpr">$ </span><span class="ccm">nexmod doctor</span></span>
+    <span class="cl"> </span>
+    <span class="cl"><span class="cc"># 4a. Install a mod by URL</span></span>
+    <span class="cl"><span class="cpr">$ </span><span class="ccm">nexmod install </span><span class="carg">https://www.nexusmods.com/warhammer40kdarktide/mods/1234</span></span>
+    <span class="cl"><span class="cc"># 4b. Or by slug + ID</span></span>
+    <span class="cl"><span class="cpr">$ </span><span class="ccm">nexmod install </span><span class="carg">darktide 1234</span></span>
+    <span class="cl"> </span>
+    <span class="cl"><span class="cc"># Check for updates whenever you feel like it</span></span>
+    <span class="cl"><span class="cpr">$ </span><span class="ccm">nexmod update </span><span class="carg">darktide -y</span></span>
+  </div>
+
+  <!-- REQUIREMENTS -->
+  <div class="req-strip">
+    <div class="req">
+      <span class="req-icon">🐧</span>
+      <span class="req-label">OS</span>
+      <span class="req-val">Linux</span>
+    </div>
+    <div class="req">
+      <span class="req-icon">🐍</span>
+      <span class="req-label">Python</span>
+      <span class="req-val">3.10+</span>
+    </div>
+    <div class="req">
+      <span class="req-icon">🔑</span>
+      <span class="req-label">Account</span>
+      <span class="req-val">Nexus Premium</span>
+    </div>
+    <div class="req">
+      <span class="req-icon">📦</span>
+      <span class="req-label">Optional</span>
+      <span class="req-val">7z (for .7z archives)</span>
+    </div>
+    <div class="req">
+      <span class="req-icon">🍷</span>
+      <span class="req-label">Optional</span>
+      <span class="req-val">Wine (Darktide patch only)</span>
+    </div>
+  </div>
+</section>
+
+</div><!-- /wrap -->
+</main>
+
+<footer>
+  <div class="wrap footer-inner">
+    <div>
+      <div class="footer-logo">nexmod</div>
+      <div class="footer-note">Built by a Darktide player tired of Vortex.</div>
+    </div>
+    <div class="footer-links">
+      <a href="https://github.com/morecitricacid-coder/nexmod">GitHub</a>
+      <a href="https://pypi.org/project/nexmod/">PyPI</a>
+      <a href="https://github.com/morecitricacid-coder/nexmod/blob/main/CHANGELOG.md">Changelog</a>
+      <span>v0.3.0</span>
+      <span>MIT</span>
+    </div>
+  </div>
+</footer>
+
+<script>
+// Copy button
+function copyCmd(btn, txt) {
+  navigator.clipboard.writeText(txt).then(() => {
+    const prev = btn.textContent;
+    btn.textContent = 'Copied!';
+    setTimeout(() => btn.textContent = prev, 2000);
+  });
+}
+
+// ── Terminal animation ────────────────────────────────────────────
+const SCRIPT = [
+  { k:'cmd', t:'nexmod doctor' },
+  { k:'out', h:'<span class="tok">✓</span>  <span class="tout">API key       configured</span>' },
+  { k:'out', h:'<span class="tok">✓</span>  <span class="tout">Premium       confirmed</span>' },
+  { k:'out', h:'<span class="tok">✓</span>  <span class="tout">Steam         ~/.steam/steam/steamapps/</span>' },
+  { k:'out', h:'<span class="tok">✓</span>  <span class="tout">Darktide      found — 32 mods tracked</span>' },
+  { k:'out', h:'<span class="tok">✓</span>  <span class="tout">Wine          /usr/bin/wine</span>' },
+  { k:'out', h:'<span class="tok">✓</span>  <span class="tout">7z            /usr/bin/7z</span>' },
+  { k:'out', h:'<span class="tok">✓</span>  <span class="tout">Disk space    148 GB free</span>' },
+  { k:'out', h:'<span class="tok">All checks passed.</span>' },
+  { k:'blank' },
+  { k:'cmd', t:'nexmod update darktide -y' },
+  { k:'out', h:'<span class="tdim">Checking 32 mods for updates...</span>' },
+  { k:'out', h:'  <span class="tamb">↑</span>  <span class="tout">Veteran Armory     </span><span class="tdim">1.4.1</span><span class="tout"> → </span><span class="tamb">1.5.0</span>' },
+  { k:'out', h:'  <span class="tamb">↑</span>  <span class="tout">Weapon Stats       </span><span class="tdim">2.0.4</span><span class="tout"> → </span><span class="tamb">2.1.0</span>' },
+  { k:'out', h:"  <span class=\"tdim\">–  Omnissiah's Eye    1.3.0  (up to date)</span>" },
+  { k:'out', h:'  <span class="tdim">–  True Level         1.0.9  (up to date)</span>' },
+  { k:'out', h:'<span class="tok">✓</span>  <span class="tout">2 updated, 30 up to date.</span>' },
+  { k:'out', h:'<span class="tok">✓</span>  <span class="tout">No missing dependencies.</span>' },
+];
+
+const tb  = document.getElementById('tb');
+const cur = document.getElementById('cur');
+
+let idx = 0, ch = 0, curSpan = null;
+const CHAR = 32, LINE = 100, PAUSE = 520, RESTART = 2800;
+
+function appendLine(html) {
+  cur.remove();
+  const s = document.createElement('span');
+  s.className = 't-line';
+  s.innerHTML = html;
+  tb.appendChild(s);
+  tb.appendChild(cur);
+  tb.scrollTop = tb.scrollHeight;
+  return s;
+}
+
+function tick() {
+  if (idx >= SCRIPT.length) {
+    setTimeout(reset, RESTART);
+    return;
+  }
+  const step = SCRIPT[idx];
+
+  if (step.k === 'blank') {
+    appendLine('');
+    SCRIPT[idx] = { k:'blank' }; // idempotent
+    idx++;
+    setTimeout(tick, LINE);
+    return;
+  }
+  if (step.k === 'out') {
+    appendLine(step.h);
+    idx++;
+    setTimeout(tick, LINE);
+    return;
+  }
+  // cmd — typewriter
+  if (!curSpan) {
+    curSpan = appendLine('<span class="tp">$ </span><span class="tc"></span>');
+  }
+  const t = curSpan.querySelector('.tc');
+  if (ch < step.t.length) {
+    t.textContent += step.t[ch++];
+    setTimeout(tick, CHAR);
+  } else {
+    idx++; ch = 0; curSpan = null;
+    setTimeout(tick, PAUSE);
+  }
+}
+
+function reset() {
+  // remove all but cursor
+  while (tb.firstChild !== cur && tb.firstChild) tb.removeChild(tb.firstChild);
+  if (!tb.contains(cur)) tb.appendChild(cur);
+  idx = 0; ch = 0; curSpan = null;
+  setTimeout(tick, 500);
+}
+
+setTimeout(tick, 900);
+</script>
+</body>
+</html>

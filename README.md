@@ -1,6 +1,9 @@
 # nexmod
 
 [![CI](https://github.com/morecitricacid-coder/nexmod/actions/workflows/ci.yml/badge.svg)](https://github.com/morecitricacid-coder/nexmod/actions/workflows/ci.yml)
+[![Pages](https://img.shields.io/badge/site-morecitricacid--coder.github.io%2Fnexmod-f59e0b)](https://morecitricacid-coder.github.io/nexmod/)
+
+**[→ nexmod.github.io](https://morecitricacid-coder.github.io/nexmod/)**
 
 A Linux-native CLI mod manager for [Nexus Mods](https://www.nexusmods.com/).
 
