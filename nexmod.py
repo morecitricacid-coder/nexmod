@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""nexmod — Nexus Mods CLI for Linux (requires Nexus Premium)"""
+"""nexmod — Nexus Mods CLI for Linux"""
 
 import click
 import requests
@@ -85,6 +85,13 @@ GAMES = {
         "name": "Fallout 4",
         "domain": "fallout4",
         "steam_id": 377160,
+        "mod_subdir": "Data",
+        "log_subpath": None,
+    },
+    "starfield": {
+        "name": "Starfield",
+        "domain": "starfield",
+        "steam_id": 1716740,
         "mod_subdir": "Data",
         "log_subpath": None,
     },
@@ -220,6 +227,7 @@ def get_db() -> sqlite3.Connection:
 # reorder, never delete. Forward-fix instead.
 SCHEMA_MIGRATIONS: list[tuple[str, str]] = [
     ("001_mods_folder_name", "ALTER TABLE mods ADD COLUMN folder_name TEXT"),
+    ("002_load_order_active_profile", "ALTER TABLE load_order_state ADD COLUMN active_profile TEXT"),
 ]
 
 
@@ -368,7 +376,15 @@ def nexus_get(endpoint: str, api_key: str) -> dict | list:
         # 403/401/404 — hard fail, no retry (won't self-heal)
         if r.status_code == 403:
             log.error("403 Forbidden on %s: %s", url, r.text[:200])
-            console.print("[red]403 Forbidden — confirm your account has Nexus Premium.[/red]")
+            if "download_link" in url:
+                console.print(
+                    "[red]403 Forbidden — direct downloads require Nexus Premium.[/red]\n"
+                    "  Free users: click [cyan]Mod Manager Download[/cyan] on nexusmods.com "
+                    "(requires [cyan]nexmod nxm-register[/cyan]) or use "
+                    "[cyan]nexmod install <game> <id> --from-file <archive>[/cyan]."
+                )
+            else:
+                console.print("[red]403 Forbidden — check your Nexus API key.[/red]")
             sys.exit(1)
         if not r.ok:
             snippet = r.text[:300]
@@ -389,11 +405,16 @@ def api_mod_files(domain: str, mod_id: int, api_key: str) -> list:
     data = nexus_get(f"games/{domain}/mods/{mod_id}/files.json", api_key)
     return data.get("files", [])
 
-def api_download_urls(domain: str, mod_id: int, file_id: int, api_key: str) -> list:
-    return nexus_get(
-        f"games/{domain}/mods/{mod_id}/files/{file_id}/download_link.json",
-        api_key,
-    )
+def api_download_urls(domain: str, mod_id: int, file_id: int, api_key: str, *,
+                      nxm_key: str | None = None,
+                      nxm_expires: str | None = None,
+                      nxm_user_id: str | None = None) -> list:
+    endpoint = f"games/{domain}/mods/{mod_id}/files/{file_id}/download_link.json"
+    params = [(k, v) for k, v in [("key", nxm_key), ("expires", nxm_expires), ("user_id", nxm_user_id)] if v]
+    if params:
+        from urllib.parse import urlencode
+        endpoint += "?" + urlencode(params)
+    return nexus_get(endpoint, api_key)
 
 def api_updated_mods(domain: str, api_key: str, period: str = "1w") -> list:
     return nexus_get(f"games/{domain}/mods/updated.json?period={period}", api_key)
@@ -1192,7 +1213,11 @@ def _handle_missing_deps(
 # ── Install Helper ────────────────────────────────────────────────────────────
 
 def do_install(game: str, mod_id: int, file_id_override: int | None,
-               api_key: str, db: sqlite3.Connection):
+               api_key: str, db: sqlite3.Connection, *,
+               nxm_key: str | None = None,
+               nxm_expires: str | None = None,
+               nxm_user_id: str | None = None,
+               from_file: "Path | None" = None):
     info   = GAMES.get(game)
     domain = info["domain"] if info else game
 
@@ -1220,39 +1245,60 @@ def do_install(game: str, mod_id: int, file_id_override: int | None,
                 console.print(f"  [{f['file_id']}] {f['file_name']} ({f.get('category_name')})")
             sys.exit(1)
 
-    console.print(f"  File: [cyan]{chosen['file_name']}[/cyan] ({chosen.get('size_kb', '?')} KB)")
-
-    with console.status("Getting CDN download link..."):
-        urls = api_download_urls(domain, mod_id, chosen["file_id"], api_key)
-
-    if not urls:
-        raise RuntimeError("Nexus returned no download URLs — check your Premium status")
     mod_dir = resolve_mod_dir(game, db)
-    tmp = DATA_DIR / "tmp"
-    tmp.mkdir(parents=True, exist_ok=True)
-    archive = tmp / chosen["file_name"]
 
-    # Disk-space pre-flight. size_kb is the only size hint Nexus reliably
-    # exposes; allow a 50 MB buffer for the .part file overhead, and 3× for
-    # extraction headroom (compressed archives expand significantly).
-    size_kb = chosen.get("size_kb") or 0
-    if size_kb > 0:
-        size_bytes = size_kb * 1024
+    if from_file:
+        archive = from_file.resolve()
+        if not archive.exists():
+            console.print(f"[red]File not found: {archive}[/red]")
+            sys.exit(1)
+        console.print(f"  File: [cyan]{archive.name}[/cyan] (local) — skipping download")
+        size_bytes = archive.stat().st_size
         try:
-            _check_disk_space(tmp, size_bytes + 50 * 1024 * 1024, "download")
             if mod_dir.exists():
                 _check_disk_space(mod_dir, size_bytes * 3, "extraction")
         except RuntimeError as e:
             record(db, "install", game, mod_id, mod["name"], mod.get("version"), "fail", str(e))
             raise
+    else:
+        console.print(f"  File: [cyan]{chosen['file_name']}[/cyan] ({chosen.get('size_kb', '?')} KB)")
+
+        with console.status("Getting CDN download link..."):
+            urls = api_download_urls(domain, mod_id, chosen["file_id"], api_key,
+                                     nxm_key=nxm_key, nxm_expires=nxm_expires, nxm_user_id=nxm_user_id)
+
+        if not urls:
+            raise RuntimeError(
+                "Nexus returned no download URLs — Premium required for direct downloads. "
+                "Free users: click 'Mod Manager Download' on nexusmods.com (requires nxm-register) "
+                "or use --from-file <archive> after downloading manually."
+            )
+        tmp = DATA_DIR / "tmp"
+        tmp.mkdir(parents=True, exist_ok=True)
+        archive = tmp / chosen["file_name"]
+
+        # Disk-space pre-flight. size_kb is the only size hint Nexus reliably
+        # exposes; allow a 50 MB buffer for the .part file overhead, and 3× for
+        # extraction headroom (compressed archives expand significantly).
+        size_kb = chosen.get("size_kb") or 0
+        if size_kb > 0:
+            size_bytes = size_kb * 1024
+            try:
+                _check_disk_space(tmp, size_bytes + 50 * 1024 * 1024, "download")
+                if mod_dir.exists():
+                    _check_disk_space(mod_dir, size_bytes * 3, "extraction")
+            except RuntimeError as e:
+                record(db, "install", game, mod_id, mod["name"], mod.get("version"), "fail", str(e))
+                raise
 
     dirs_before = {p.name for p in mod_dir.iterdir() if p.is_dir()} if mod_dir.exists() else set()
 
     extraction_ok = False
     try:
-        _try_download_with_mirrors(urls, archive)
-        if chosen.get("md5"):
-            verify_md5(archive, chosen["md5"])
+        if not from_file:
+            _try_download_with_mirrors(urls, archive)
+            if chosen.get("md5"):
+                verify_md5(archive, chosen["md5"])
 
         # Conflict detection: peek archive contents and warn if any top-level
         # folder is already claimed by a different tracked mod. Best-effort
@@ -1291,7 +1337,8 @@ def do_install(game: str, mod_id: int, file_id_override: int | None,
         record(db, "install", game, mod_id, mod["name"], mod.get("version"), "fail", str(e))
         raise
     finally:
-        archive.unlink(missing_ok=True)
+        if not from_file:
+            archive.unlink(missing_ok=True)
 
     if not extraction_ok:
         raise RuntimeError("Extraction did not complete — DB not written")
@@ -1309,6 +1356,10 @@ def do_install(game: str, mod_id: int, file_id_override: int | None,
         log.info("Multi-folder install for mod_id=%s: %s", mod_id, new_dirs)
     folder_name = new_dirs[0] if new_dirs else None
 
+    # When installing from a local file the recorded filename is the actual
+    # archive, not the API's canonical file_name (which may differ).
+    recorded_filename = archive.name if from_file else chosen["file_name"]
+
     db.execute("""
         INSERT INTO mods
             (game, mod_id, file_id, name, version, filename, mod_dir,
@@ -1324,7 +1375,7 @@ def do_install(game: str, mod_id: int, file_id_override: int | None,
             updated_at  = excluded.updated_at
     """, (
         game, mod_id, chosen["file_id"], mod["name"], mod.get("version"),
-        chosen["file_name"], str(mod_dir), folder_name, now_iso(), now_iso(),
+        recorded_filename, str(mod_dir), folder_name, now_iso(), now_iso(),
     ))
     db.commit()
     record(db, "install", game, mod_id, mod["name"], mod.get("version"), "ok")
@@ -1392,7 +1443,10 @@ def _read_profile(game: str, name: str) -> dict:
     return json.loads(path.read_text())
 
 
-def _write_profile(game: str, name: str, load_order: list[str], description: str = "") -> Path:
+def _write_profile(
+    game: str, name: str, load_order: list[str],
+    description: str = "", directives: list[str] | None = None,
+) -> Path:
     path = _profile_path(game, name)
     path.parent.mkdir(parents=True, exist_ok=True)
     existing_created = None
@@ -1408,6 +1462,7 @@ def _write_profile(game: str, name: str, load_order: list[str], description: str
         "created_at":  existing_created or now_iso(),
         "updated_at":  now_iso(),
         "load_order":  load_order,
+        "directives":  directives or [],
     }
     path.write_text(json.dumps(data, indent=2))
     return path
@@ -1425,12 +1480,6 @@ def _list_profiles(game: str) -> list[dict]:
             pass
     return profiles
 
-
-def _apply_profile(mod_dir: Path, load_order_file: str, load_order: list[str]):
-    """Write a profile's load order list to mod_load_order.txt."""
-    lof = mod_dir / load_order_file
-    header = ["-- File managed by nexmod"]
-    lof.write_text("\n".join(header + load_order) + "\n")
 
 
 _ARCHIVE_EXTS = (".tar.gz", ".tar.bz2", ".tar.xz", ".tgz", ".zip", ".7z", ".tar", ".rar")
@@ -1655,10 +1704,15 @@ def _classify_entries(
     db_folders: set[str],
     disk_folders: set[str],
     framework_folders: set[str],
+    force_drop: set[str] | None = None,
 ) -> dict[str, str]:
     """Classify each listed folder: managed-present | managed-missing | orphan | foreign | framework."""
+    _force_drop = force_drop or set()
     out: dict[str, str] = {}
     for f in entries:
+        if f in _force_drop:
+            out[f] = "orphan"
+            continue
         in_db, on_disk = (f in db_folders), (f in disk_folders)
         if in_db and on_disk:
             out[f] = "managed-present"
@@ -1822,6 +1876,8 @@ def reconcile_load_order(
     auto_merge: bool = False,
     profile_set: list[str] | None = None,
     strict_profile: bool = False,
+    inject_directives: list[str] | None = None,
+    force_drop: set[str] | None = None,
 ) -> dict:
     """Reconcile mod_load_order.txt against DB + disk + pins + directives.
 
@@ -1876,6 +1932,15 @@ def reconcile_load_order(
         tail_comments     = parsed["tail_comments"]
         directive_lines   = parsed["directive_lines"]
 
+        # Merge profile-saved directives that aren't already in the file.
+        # This restores pins/freeze when loading a profile onto a fresh machine.
+        if inject_directives:
+            existing_dir_set = set(directive_lines)
+            new_dirs = [d for d in inject_directives if d not in existing_dir_set]
+            if new_dirs:
+                directive_lines = directive_lines + new_dirs
+                directives = _parse_directives(directive_lines)
+
         frozen = directives["frozen"]
 
         disk            = _disk_folders(mod_dir)
@@ -1890,6 +1955,7 @@ def reconcile_load_order(
             db_folders=db_folders,
             disk_folders=disk,
             framework_folders=framework_set,
+            force_drop=force_drop or set(),
         )
 
         orphans_dropped = [f for f, c in classification.items()
@@ -2073,7 +2139,7 @@ def _empty_reconcile_result() -> dict:
 @click.version_option(version=__version__, prog_name="nexmod")
 @click.pass_context
 def cli(ctx, verbose):
-    """nexmod — download and update Nexus mods on Linux (Premium required)"""
+    """nexmod — download and update Nexus mods on Linux"""
     ctx.ensure_object(dict)
     ctx.obj["verbose"] = verbose
     setup_logging(verbose)
@@ -2119,10 +2185,14 @@ def config_verify():
         name    = data.get("name", "?")
         premium = data.get("is_premium", False)
         console.print(f"[green]Authenticated as:[/green] {name}")
-        console.print(f"Premium:   {'[green]YES[/green]' if premium else '[red]NO — downloads will fail[/red]'}")
+        console.print(f"Premium:   {'[green]YES[/green]' if premium else '[yellow]NO[/yellow]'}")
         console.print(f"Supporter: {'yes' if data.get('is_supporter') else 'no'}")
         if not premium:
-            console.print("[yellow]Warning: download commands require Premium.[/yellow]")
+            console.print(
+                "[yellow]Free account: direct downloads unavailable.[/yellow]\n"
+                "  Use [cyan]nexmod nxm-register[/cyan] then click 'Mod Manager Download' on nexusmods.com,\n"
+                "  or download archives manually and use [cyan]nexmod install <game> <id> --from-file <archive>[/cyan]."
+            )
     except Exception as e:
         log.error("API verify failed: %s", e)
         console.print(f"[red]API error: {e}[/red]")
@@ -2149,14 +2219,17 @@ def profile():
 
 @profile.command("save")
 @click.argument("game")
-@click.argument("name")
+@click.argument("name", default="default")
 @click.option("--description", "-d", default="", help="Short description stored with the profile")
 @click.option("--force", "-f", is_flag=True, help="Overwrite without prompting if profile exists")
 def profile_save(game, name, description, force):
     """Snapshot the current load order as a named profile.
 
+    NAME defaults to 'default' if omitted.
+
     \b
     Examples:
+      nexmod profile save darktide
       nexmod profile save darktide full
       nexmod profile save darktide minimal -d "QoL only, no combat changes"
     """
@@ -2167,7 +2240,12 @@ def profile_save(game, name, description, force):
 
     db      = get_db()
     mod_dir = resolve_mod_dir(game, db)
-    folders = _read_lof_folders(mod_dir, info["load_order_file"])
+
+    lof_path = mod_dir / info["load_order_file"]
+    lof_text = lof_path.read_text() if lof_path.exists() else ""
+    parsed   = _parse_load_order_file(lof_text)
+    folders  = parsed["entries"]
+    directive_lines = parsed["directive_lines"]
 
     if not folders:
         console.print(f"[yellow]Load order file is empty or missing for {game}.[/yellow]")
@@ -2179,7 +2257,17 @@ def profile_save(game, name, description, force):
             console.print("[dim]Aborted.[/dim]")
             return
 
-    _write_profile(game, name, folders, description)
+    # Warn about foreign (untracked) entries — they can't be auto-installed later.
+    tracked = _db_tracked_folders(db, game)
+    foreign = [f for f in folders if f not in tracked]
+    if foreign:
+        label = ", ".join(foreign[:5]) + (" ..." if len(foreign) > 5 else "")
+        console.print(
+            f"[yellow]Note:[/yellow] {len(foreign)} folder(s) not tracked by nexmod "
+            f"(cannot be auto-installed via --install): {label}"
+        )
+
+    _write_profile(game, name, folders, description, directive_lines)
     log.info("Profile '%s' saved for %s (%d mods)", name, game, len(folders))
     console.print(f"[green]✓ Profile saved:[/green] {name} ({len(folders)} mods)")
 
@@ -2191,17 +2279,24 @@ def profile_list(game):
     profiles = _list_profiles(game)
     if not profiles:
         console.print(f"[yellow]No profiles saved for {game}.[/yellow]")
-        console.print(f"Create one: nexmod profile save {game} <name>")
+        console.print(f"Create one: nexmod profile save {game}")
         return
+
+    db  = get_db()
+    row = db.execute("SELECT active_profile FROM load_order_state WHERE game=?", (game,)).fetchone()
+    active = row["active_profile"] if row else None
 
     t = Table(title=f"Profiles — {game}", show_lines=False)
     t.add_column("Name",        style="bold cyan")
+    t.add_column("",            width=8)
     t.add_column("Mods",        justify="right", style="dim")
     t.add_column("Updated",     style="dim")
     t.add_column("Description")
     for p in profiles:
+        marker = "[green]active[/green]" if p["name"] == active else ""
         t.add_row(
             p["name"],
+            marker,
             str(len(p.get("load_order", []))),
             (p.get("updated_at") or p.get("created_at") or "?")[:10],
             p.get("description") or "",
@@ -2245,21 +2340,27 @@ def profile_show(game, name):
 
 @profile.command("load")
 @click.argument("game")
-@click.argument("name")
+@click.argument("name", default="default")
 @click.option("--dry-run", is_flag=True, help="Show what would change without writing anything")
 @click.option("--install", "do_install_missing", is_flag=True,
               help="Install profile mods not on disk (uses tracked mod_id from the DB).")
 @click.option("--strict", is_flag=True,
               help="Also drop foreign entries (untracked folders the user/game added). "
                    "Default preserves them.")
-def profile_load(game, name, dry_run, do_install_missing, strict):
+@click.option("--auto-merge", "auto_merge", is_flag=True,
+              help="Apply even if the load order file was edited externally since last write.")
+def profile_load(game, name, dry_run, do_install_missing, strict, auto_merge):
     """Apply a profile — sets the managed load order to the profile's mod list.
+
+    NAME defaults to 'default'. If 'default' has not been saved yet, it is
+    auto-created from the current load order before loading.
 
     Mods in the profile are pinned to load. Foreign entries (folders not
     tracked by nexmod) are preserved by default; pass --strict to drop them.
 
     \b
     Examples:
+      nexmod profile load darktide
       nexmod profile load darktide minimal
       nexmod profile load darktide full --dry-run
       nexmod profile load darktide full --install
@@ -2274,10 +2375,24 @@ def profile_load(game, name, dry_run, do_install_missing, strict):
         console.print(f"[yellow]{game} does not support a managed load order.[/yellow]")
         return
 
-    p         = _read_profile(game, name)
-    db        = get_db()
-    mod_dir   = resolve_mod_dir(game, db)
-    lof_file  = info["load_order_file"]
+    db      = get_db()
+    mod_dir = resolve_mod_dir(game, db)
+
+    # Auto-create "default" from current LOF if it hasn't been saved yet.
+    if name == "default" and not _profile_path(game, "default").exists():
+        lof_text = ""
+        lof_path = mod_dir / info["load_order_file"]
+        if lof_path.exists():
+            lof_text = lof_path.read_text()
+        pdefault = _parse_load_order_file(lof_text)
+        _write_profile(
+            game, "default", pdefault["entries"],
+            "Auto-created default profile", pdefault["directive_lines"],
+        )
+        console.print(f"[dim]Auto-created 'default' profile ({len(pdefault['entries'])} mods).[/dim]")
+
+    p        = _read_profile(game, name)
+    lof_file = info["load_order_file"]
 
     profile_order = p.get("load_order", [])
     current_order = _read_lof_folders(mod_dir, lof_file)
@@ -2286,7 +2401,6 @@ def profile_load(game, name, dry_run, do_install_missing, strict):
     current_set  = set(current_order)
     added        = [m for m in profile_order if m not in current_set]
     removed      = [m for m in current_order  if m not in profile_set]
-    unchanged    = len(profile_order) - len(added)
 
     # Warn about profile mods not on disk
     missing_on_disk = [m for m in profile_order if not (mod_dir / m).exists()]
@@ -2297,8 +2411,22 @@ def profile_load(game, name, dry_run, do_install_missing, strict):
         console.print(f"  [green]+[/green] Enabling:  {', '.join(added)}")
     if removed:
         console.print(f"  [yellow]-[/yellow] Disabling: {', '.join(removed)}")
-    if not added and not removed and not missing_on_disk:
+    # Check if any saved directives are missing from the current file — if so,
+    # we still need reconcile to run even if the folder list is identical.
+    saved_directives  = p.get("directives", [])
+    lof_text_for_dirs = (mod_dir / lof_file).read_text() if (mod_dir / lof_file).exists() else ""
+    current_dir_lines = _parse_load_order_file(lof_text_for_dirs)["directive_lines"]
+    pending_directives = [d for d in saved_directives if d not in set(current_dir_lines)]
+
+    if not added and not removed and not missing_on_disk and not pending_directives:
         console.print(f"  [dim]Load order already matches this profile — no changes.[/dim]")
+        # Still record this as the active profile.
+        db.execute("""
+            INSERT INTO load_order_state (game, file_path, last_hash, last_written_at, frozen, active_profile)
+            VALUES (?, '', '', '', 0, ?)
+            ON CONFLICT(game) DO UPDATE SET active_profile = excluded.active_profile
+        """, (game, name))
+        db.commit()
         return
     if missing_on_disk:
         console.print(f"\n  [red]Warning:[/red] {len(missing_on_disk)} profile mod(s) not on disk "
@@ -2308,14 +2436,14 @@ def profile_load(game, name, dry_run, do_install_missing, strict):
     if do_install_missing and missing_on_disk:
         api_key = get_api_key()
         rows    = db.execute(
-            "SELECT mod_id, name, filename FROM mods WHERE game = ?", (game,)
+            "SELECT mod_id, name, filename, folder_name FROM mods WHERE game = ?", (game,)
         ).fetchall()
-        # folder name is the archive basename (extension stripped) — same
-        # convention used by 'remove --purge'. Build the lookup once.
+        # Prefer folder_name column (written at install time); fall back to archive basename.
         folder_to_mod_id: dict[str, int] = {}
         for r in rows:
-            if r["filename"]:
-                folder_to_mod_id[_archive_basename(r["filename"])] = r["mod_id"]
+            fn = r["folder_name"] or (_archive_basename(r["filename"]) if r["filename"] else None)
+            if fn:
+                folder_to_mod_id[fn] = r["mod_id"]
 
         installed = 0
         skipped: list[str] = []
@@ -2343,14 +2471,18 @@ def profile_load(game, name, dry_run, do_install_missing, strict):
     result = reconcile_load_order(
         game, db, mod_dir,
         dry_run=dry_run,
+        auto_merge=auto_merge,
         profile_set=profile_order,
         strict_profile=strict,
+        inject_directives=p.get("directives", []),
     )
 
     if result["drift_detected"] and not result["written"]:
-        console.print("[yellow]External edit to load order detected — refusing to overwrite. "
-                      "Re-run after reviewing 'nexmod order " + game + " --check', "
-                      "or pass --auto-merge (future).[/yellow]")
+        console.print(
+            "[yellow]External edit to load order detected — refusing to overwrite.\n"
+            f"Review with 'nexmod order {game}' first, "
+            "or pass --auto-merge to apply anyway.[/yellow]"
+        )
         return
 
     if dry_run:
@@ -2360,6 +2492,15 @@ def profile_load(game, name, dry_run, do_install_missing, strict):
         return
 
     log.info("Profile '%s' applied for %s (%d mods)", name, game, len(profile_order))
+
+    # Always record the active profile — even when no write was needed.
+    db.execute("""
+        INSERT INTO load_order_state (game, file_path, last_hash, last_written_at, frozen, active_profile)
+        VALUES (?, '', '', '', 0, ?)
+        ON CONFLICT(game) DO UPDATE SET active_profile = excluded.active_profile
+    """, (game, name))
+    db.commit()
+
     if result["written"]:
         console.print(f"\n[green]✓ Profile '{name}' applied.[/green]")
         if result["foreign_kept"] and not strict:
@@ -2386,6 +2527,29 @@ def profile_delete(game, name, force):
     path.unlink()
     log.info("Profile '%s' deleted for %s", name, game)
     console.print(f"[green]✓ Deleted profile '{name}'.[/green]")
+
+
+@profile.command("status")
+@click.argument("game")
+def profile_status(game):
+    """Show which profile is currently active for GAME."""
+    db  = get_db()
+    row = db.execute("SELECT active_profile FROM load_order_state WHERE game=?", (game,)).fetchone()
+    active = row["active_profile"] if row else None
+    if not active:
+        console.print(f"[dim]No profile loaded yet for {game}.[/dim]")
+        console.print(f"Load one: nexmod profile load {game} <name>")
+        return
+    profiles = {p["name"]: p for p in _list_profiles(game)}
+    p = profiles.get(active)
+    if p:
+        console.print(f"[bold]Active:[/bold] [cyan]{active}[/cyan] "
+                      f"({len(p.get('load_order', []))} mods)")
+        if p.get("description"):
+            console.print(f"[dim]{p['description']}[/dim]")
+    else:
+        console.print(f"[bold]Active:[/bold] [cyan]{active}[/cyan] "
+                      f"[yellow](profile file missing — run 'nexmod profile save {game} {active}' to recreate)[/yellow]")
 
 
 @profile.command("rename")
@@ -2935,13 +3099,16 @@ def scan_vortex(game, dry_run):
 @click.option("--no-reorder", is_flag=True, help="Skip automatic load order sort after install")
 @click.option("--dry-run", is_flag=True,
               help="Resolve mod metadata + show what would be downloaded; do not fetch or extract.")
-def install(game, mod_id, file_id, no_reorder, dry_run):
+@click.option("--from-file", "from_file", type=click.Path(path_type=Path), default=None,
+              help="Install from a local archive instead of downloading (free accounts, manual downloads).")
+def install(game, mod_id, file_id, no_reorder, dry_run, from_file):
     """Download and install a mod. Starts tracking it for updates.
 
     \b
     Accepts a Nexus Mods URL or a game slug + mod ID:
       nexmod install https://www.nexusmods.com/warhammer40kdarktide/mods/1234
       nexmod install darktide 1234
+      nexmod install darktide 1234 --from-file ~/Downloads/mymod-1.2.zip
     """
     if "nexusmods.com" in game or game.startswith("http"):
         parsed_game, parsed_mod_id, parsed_file_id = parse_nexus_url(game)
@@ -2986,7 +3153,7 @@ def install(game, mod_id, file_id, no_reorder, dry_run):
             "you'll need wine to run [cyan]nexmod enable darktide[/cyan]."
         )
 
-    name, version = do_install(game, mod_id, file_id, api_key, db)
+    name, version = do_install(game, mod_id, file_id, api_key, db, from_file=from_file)
     console.print(f"\n[green]✓ Installed:[/green] {name} v{version}")
 
     info = GAMES.get(game)
@@ -3804,10 +3971,16 @@ def remove_mod(game, mod_id, purge, yes, force_legacy_purge, dry_run):
 
     # Reconcile the load order: drops orphaned entries, preserves foreign,
     # auto-adds discovered framework folders, topo-sorts.
+    # force_drop ensures the removed mod's folder is treated as an orphan even
+    # if its files are still on disk (files-on-disk → "foreign" → kept otherwise).
     info = GAMES.get(game) or {}
     if info.get("load_order_file") and row["mod_dir"]:
+        removed_folder = row["folder_name"] or None
         try:
-            result = reconcile_load_order(game, db, Path(row["mod_dir"]))
+            result = reconcile_load_order(
+                game, db, Path(row["mod_dir"]),
+                force_drop={removed_folder} if removed_folder else None,
+            )
             dropped = result["orphans_dropped"]
             if dropped:
                 console.print(f"[dim]Load order: dropped {len(dropped)} orphaned "
@@ -3819,6 +3992,19 @@ def remove_mod(game, mod_id, purge, yes, force_legacy_purge, dry_run):
         except Exception as e:
             log.warning("reconcile after remove failed: %s", e)
             console.print(f"[yellow]Load order reconcile failed: {e}[/yellow]")
+
+
+# uninstall ───────────────────────────────────────────────────────────────────
+
+@cli.command("uninstall")
+@click.argument("game")
+@click.argument("mod_id", type=int)
+@click.option("--yes", "-y", is_flag=True, help="Skip the confirmation prompt")
+@click.pass_context
+def uninstall_mod(ctx, game, mod_id, yes):
+    """Remove a mod and delete its files from disk (alias for: remove --purge)."""
+    ctx.invoke(remove_mod, game=game, mod_id=mod_id, purge=True, yes=yes,
+               force_legacy_purge=False, dry_run=False)
 
 
 # fsck ────────────────────────────────────────────────────────────────────────
@@ -4193,7 +4379,10 @@ def nxm_handle(uri, no_reorder):
 
     api_key = get_api_key()
     db = get_db()
-    name, version = do_install(game, parsed["mod_id"], parsed["file_id"], api_key, db)
+    name, version = do_install(
+        game, parsed["mod_id"], parsed["file_id"], api_key, db,
+        nxm_key=parsed["key"], nxm_expires=parsed["expires"], nxm_user_id=parsed["user_id"],
+    )
     console.print(f"\n[green]✓ Installed:[/green] {name} v{version}")
 
 
