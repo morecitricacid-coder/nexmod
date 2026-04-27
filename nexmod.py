@@ -2671,6 +2671,10 @@ def doctor(game):
                           f"[yellow]({warnings} warning{'s' if warnings != 1 else ''})[/yellow]")
         else:
             console.print("[green]All checks passed.[/green]")
+        console.print(
+            "[dim]→ Next: nexmod install <game> <mod_id>  "
+            "or  nexmod install <nexus-url>[/dim]"
+        )
         sys.exit(0)
     else:
         console.print("[red]One or more checks failed. Address above before running install/update.[/red]")
@@ -2992,37 +2996,64 @@ def show_mod_info(game, mod_id):
 
 @cli.command("check")
 @click.argument("game")
-def check_updates(game):
+@click.option("--json", "output_json", is_flag=True,
+              help="Emit machine-readable JSON instead of a table.")
+def check_updates(game, output_json):
     """Check all tracked mods for available updates (no download)."""
+    from contextlib import nullcontext
     api_key = get_api_key()
     db      = get_db()
     rows    = db.execute("SELECT * FROM mods WHERE game = ?", (game,)).fetchall()
     if not rows:
-        console.print(f"[yellow]No mods tracked for '{game}'.[/yellow]")
+        if output_json:
+            click.echo("[]")
+        else:
+            console.print(f"[yellow]No mods tracked for '{game}'.[/yellow]")
         return
 
     info   = GAMES.get(game, {})
     domain = info.get("domain", game)
 
-    t = Table(title=f"Update check — {game}", show_lines=False)
-    t.add_column("Name")
-    t.add_column("Installed", style="dim")
-    t.add_column("Latest", style="cyan")
-    t.add_column("Status")
+    if not output_json:
+        t = Table(title=f"Update check — {game}", show_lines=False)
+        t.add_column("Name")
+        t.add_column("Installed", style="dim")
+        t.add_column("Latest", style="cyan")
+        t.add_column("Status")
+    results = []
 
     for r in rows:
+        ctx = nullcontext() if output_json else console.status(f"Checking {r['name']}...")
         try:
-            with console.status(f"Checking {r['name']}..."):
+            with ctx:
                 mod    = api_mod_info(domain, r["mod_id"], api_key)
             latest = mod.get("version", "?")
             cur    = r["version"] or "?"
-            status = "[green]Current[/green]" if latest == cur else f"[yellow]Update → {latest}[/yellow]"
-            t.add_row(r["name"], cur, latest, status)
+            if output_json:
+                results.append({
+                    "game": game, "mod_id": r["mod_id"], "name": r["name"],
+                    "installed": cur, "latest": latest,
+                    "update_available": latest != cur and latest != "?",
+                    "error": None,
+                })
+            else:
+                label = "[green]Current[/green]" if latest == cur else f"[yellow]Update → {latest}[/yellow]"
+                t.add_row(r["name"], cur, latest, label)
         except Exception as e:
             log.error("Check failed for mod_id=%s: %s", r["mod_id"], e)
-            t.add_row(r["name"], r["version"] or "?", "?", f"[red]error: {e}[/red]")
+            if output_json:
+                results.append({
+                    "game": game, "mod_id": r["mod_id"], "name": r["name"],
+                    "installed": r["version"] or "?", "latest": None,
+                    "update_available": None, "error": str(e),
+                })
+            else:
+                t.add_row(r["name"], r["version"] or "?", "?", f"[red]error: {e}[/red]")
 
-    console.print(t)
+    if output_json:
+        click.echo(json.dumps(results, indent=2))
+    else:
+        console.print(t)
 
 
 # order ───────────────────────────────────────────────────────────────────────
@@ -3331,13 +3362,19 @@ def _print_classification(classification: dict[str, str]) -> None:
 @click.option("--yes", "-y", is_flag=True, help="Skip confirmation prompts")
 @click.option("--no-reorder", is_flag=True, help="Skip automatic load order sort after update")
 @click.option("--fix-deps", is_flag=True, help="Interactively install any missing dependencies surfaced after the update scan (default: report only).")
-def update_mods(game, mod_id, yes, no_reorder, fix_deps):
+@click.option("--json", "output_json", is_flag=True,
+              help="Emit machine-readable JSON summary. Implies --yes.")
+def update_mods(game, mod_id, yes, no_reorder, fix_deps, output_json):
     """Download and apply all available updates for GAME.
 
     Always scans for missing dependencies after the update pass — even when
     no mods needed updating. By default, missing deps are reported only;
     pass --fix-deps to be prompted to install each one.
     """
+    from contextlib import nullcontext
+    if output_json:
+        yes = True  # non-interactive when machine-readable output requested
+
     api_key = get_api_key()
     db      = get_db()
 
@@ -3349,52 +3386,77 @@ def update_mods(game, mod_id, yes, no_reorder, fix_deps):
     rows = db.execute(q, p).fetchall()
 
     if not rows:
-        console.print(f"[yellow]No mods tracked for '{game}'.[/yellow]")
+        if output_json:
+            click.echo(json.dumps({"game": game, "updated": [], "current": [],
+                                   "failed": [], "missing_deps": {}, "load_order": {}}))
+        else:
+            console.print(f"[yellow]No mods tracked for '{game}'.[/yellow]")
         return
 
     info   = GAMES.get(game, {})
     domain = info.get("domain", game)
 
-    updated_count = 0
+    updated_count  = 0
+    json_updated:  list = []
+    json_current:  list = []
+    json_failed:   list = []
+
     for r in rows:
-        with console.status(f"Checking {r['name']}..."):
+        ctx = nullcontext() if output_json else console.status(f"Checking {r['name']}...")
+        with ctx:
             try:
                 mod    = api_mod_info(domain, r["mod_id"], api_key)
                 latest = mod.get("version", "?")
             except Exception as e:
                 log.error("Update check failed for mod_id=%s: %s", r["mod_id"], e)
-                console.print(f"[red]{r['name']}: error — {e}[/red]")
+                if not output_json:
+                    console.print(f"[red]{r['name']}: error — {e}[/red]")
                 record(db, "update", game, r["mod_id"], r["name"], None, "fail", str(e))
+                json_failed.append({"mod_id": r["mod_id"], "name": r["name"], "error": str(e)})
                 continue
 
         if latest == r["version"]:
-            console.print(f"[dim]{r['name']}: current ({latest})[/dim]")
+            if not output_json:
+                console.print(f"[dim]{r['name']}: current ({latest})[/dim]")
+            json_current.append({"mod_id": r["mod_id"], "name": r["name"], "version": latest})
             continue
 
-        console.print(f"[cyan]{r['name']}:[/cyan] {r['version']} → {latest}")
+        if not output_json:
+            console.print(f"[cyan]{r['name']}:[/cyan] {r['version']} → {latest}")
         if not yes and not click.confirm("  Download update?", default=True):
             record(db, "update", game, r["mod_id"], r["name"], latest, "skip")
+            json_current.append({"mod_id": r["mod_id"], "name": r["name"],
+                                  "version": r["version"], "skipped": True})
             continue
 
-        with console.status("Getting files..."):
+        ctx2 = nullcontext() if output_json else console.status("Getting files...")
+        with ctx2:
             files  = api_mod_files(domain, r["mod_id"], api_key)
             chosen = pick_main_file(files)
 
         if not chosen:
             log.error("No main file for update: mod_id=%s", r["mod_id"])
-            console.print(f"  [red]Could not determine update file — skipping.[/red]")
+            if not output_json:
+                console.print(f"  [red]Could not determine update file — skipping.[/red]")
             record(db, "update", game, r["mod_id"], r["name"], latest, "fail", "no main file")
+            json_failed.append({"mod_id": r["mod_id"], "name": r["name"],
+                                 "error": "no main file found"})
             continue
 
-        with console.status("Getting CDN link..."):
+        ctx3 = nullcontext() if output_json else console.status("Getting CDN link...")
+        with ctx3:
             urls = api_download_urls(domain, r["mod_id"], chosen["file_id"], api_key)
 
         if not urls:
             record(db, "update", game, r["mod_id"], r["name"], latest, "fail", "no download URLs")
-            console.print(f"  [red]No download URLs returned — check Premium status.[/red]")
+            if not output_json:
+                console.print(f"  [red]No download URLs returned — check Premium status.[/red]")
+            json_failed.append({"mod_id": r["mod_id"], "name": r["name"],
+                                 "error": "no download URLs"})
             continue
-        mod_dir      = resolve_mod_dir(game, db)
-        tmp          = DATA_DIR / "tmp"
+
+        mod_dir = resolve_mod_dir(game, db)
+        tmp     = DATA_DIR / "tmp"
         tmp.mkdir(parents=True, exist_ok=True)
         archive = tmp / chosen["file_name"]
 
@@ -3407,7 +3469,9 @@ def update_mods(game, mod_id, yes, no_reorder, fix_deps):
                     _check_disk_space(mod_dir, size_bytes * 3, "extraction")
             except RuntimeError as e:
                 record(db, "update", game, r["mod_id"], r["name"], latest, "fail", str(e))
-                console.print(f"  [red]Skipping: {e}[/red]")
+                if not output_json:
+                    console.print(f"  [red]Skipping: {e}[/red]")
+                json_failed.append({"mod_id": r["mod_id"], "name": r["name"], "error": str(e)})
                 continue
 
         extraction_ok = False
@@ -3415,7 +3479,8 @@ def update_mods(game, mod_id, yes, no_reorder, fix_deps):
             _try_download_with_mirrors(urls, archive)
             if chosen.get("md5"):
                 verify_md5(archive, chosen["md5"])
-            console.print(f"  Extracting to [dim]{mod_dir}[/dim]...")
+            if not output_json:
+                console.print(f"  Extracting to [dim]{mod_dir}[/dim]...")
             extract_archive(archive, mod_dir)
             extraction_ok = True
             try:
@@ -3424,7 +3489,9 @@ def update_mods(game, mod_id, yes, no_reorder, fix_deps):
                 log.warning("snapshot save failed: %s", e)
         except Exception as e:
             record(db, "update", game, r["mod_id"], r["name"], latest, "fail", str(e))
-            console.print(f"  [red]Failed: {e}[/red]")
+            if not output_json:
+                console.print(f"  [red]Failed: {e}[/red]")
+            json_failed.append({"mod_id": r["mod_id"], "name": r["name"], "error": str(e)})
         finally:
             archive.unlink(missing_ok=True)
 
@@ -3437,31 +3504,39 @@ def update_mods(game, mod_id, yes, no_reorder, fix_deps):
         )
         db.commit()
         record(db, "update", game, r["mod_id"], r["name"], latest, "ok")
-        console.print(f"  [green]✓ Updated to {latest}[/green]")
+        if not output_json:
+            console.print(f"  [green]✓ Updated to {latest}[/green]")
+        json_updated.append({"mod_id": r["mod_id"], "name": r["name"],
+                              "from": r["version"], "to": latest})
         updated_count += 1
 
-    console.print(f"\n[bold]Done.[/bold] {updated_count} mod(s) updated.")
+    if not output_json:
+        console.print(f"\n[bold]Done.[/bold] {updated_count} mod(s) updated.")
 
-    # Always run the dep/order scan — even when nothing updated. Missing deps
-    # are silent rot when this only fired on updated_count > 0; users would
-    # eventually get told only when something else triggered an install.
+    # Always run the dep/order scan — even when nothing updated.
     info = GAMES.get(game, {})
+    json_lof: dict = {}
     if info.get("load_order_file") and not no_reorder and get_auto_reorder():
         mod_dir = resolve_mod_dir(game, db)
-        # do_install ran reconcile per-mod. Final reconcile + diagnostic pass.
-        result = reconcile_load_order(game, db, mod_dir)
-        if result["written"]:
-            console.print(f"[dim]Load order sorted.[/dim]")
-        if result["cycles"]:
-            console.print(f"[yellow]Dependency cycle detected: {', '.join(result['cycles'])}[/yellow]")
-        if result["drift_detected"] and not result["written"]:
-            console.print("[yellow]Load order: external edit detected — not modified.[/yellow]")
+        result  = reconcile_load_order(game, db, mod_dir)
+        json_lof = {
+            "written":        result["written"],
+            "cycles":         result.get("cycles", []),
+            "drift_detected": result.get("drift_detected", False),
+        }
+        if not output_json:
+            if result["written"]:
+                console.print(f"[dim]Load order sorted.[/dim]")
+            if result["cycles"]:
+                console.print(f"[yellow]Dependency cycle detected: {', '.join(result['cycles'])}[/yellow]")
+            if result["drift_detected"] and not result["written"]:
+                console.print("[yellow]Load order: external edit detected — not modified.[/yellow]")
         if result["missing_deps"]:
             if fix_deps:
                 newly = _handle_missing_deps(game, result["missing_deps"], mod_dir, api_key, db)
                 if newly:
                     reconcile_load_order(game, db, mod_dir)
-            else:
+            elif not output_json:
                 n_mods = len(result["missing_deps"])
                 n_deps = sum(len(d) for d in result["missing_deps"].values())
                 console.print(
@@ -3472,6 +3547,19 @@ def update_mods(game, mod_id, yes, no_reorder, fix_deps):
                 console.print(
                     f"  [dim]Re-run with [cyan]--fix-deps[/cyan] to install them interactively.[/dim]"
                 )
+            if output_json:
+                json_lof["missing_deps"] = {
+                    k: v for k, v in result["missing_deps"].items()
+                }
+
+    if output_json:
+        click.echo(json.dumps({
+            "game":         game,
+            "updated":      json_updated,
+            "current":      json_current,
+            "failed":       json_failed,
+            "load_order":   json_lof,
+        }, indent=2))
 
 
 # remove ──────────────────────────────────────────────────────────────────────

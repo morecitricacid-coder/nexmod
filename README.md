@@ -70,7 +70,7 @@ pip install --user nexmod
 ```bash
 git clone https://github.com/morecitricacid-coder/nexmod
 cd nexmod
-pip install -e . --user
+pip install -e ".[dev]"
 ```
 
 ### Shell script (no pip)
@@ -390,14 +390,91 @@ The SQLite DB is safe to read concurrently while nexmod is running — WAL is en
 
 ## For Automation / LLMs
 
-- **Read-only / no-network commands:** `list`, `list --json`, `history`, `logs`, `path show`, `games`, `profile list`, `profile show`, `config show`, `snapshots`, `fsck` (without `--fix`), `rollback --list`. Safe to invoke without an API key.
-- **Network / API key required:** `install`, `track`, `update`, `check`, `scan`, `info`, `config verify`, `doctor`, `nxm`, `fsck --with-api`.
-- **Inspect state without parsing CLI output:** read `~/.local/share/nexmod/mods.db` directly. WAL mode means concurrent readers are fine.
-- **Stable JSON contract:** `nexmod list <game> --json` (full DB row per mod). Other commands do not yet emit JSON — expect Rich-formatted tables.
-- **Idempotency:** `track`, `scan`, `path set`, `fsck --fix`, `nxm-register` are safe to re-run. `install` re-extracts and bumps `updated_at`. `profile save` overwrites without prompt only with `-f`.
-- **Non-interactive flags:** `update -y`, `remove --yes`, `rollback --yes` skip confirmations. `install --dry-run` and `remove --dry-run` make no changes. `nexmod doctor` exits 1 on any required-check failure (warnings still exit 0).
-- **Determining freshness:** `version IS NULL` means scanned-but-not-yet-updated (Vortex import); a normal `update` will pull the current Nexus version.
-- **Network resilience is automatic:** clients don't need to retry — `nexus_get` and `download_file` retry transient errors internally with exponential backoff and respect `Retry-After`. Tune via env vars (see Configuration).
+### Command categories
+
+| Category | Commands |
+|----------|----------|
+| **Read-only, no network, no API key** | `list`, `list --json`, `history`, `logs`, `path show`, `games`, `profile list`, `profile show`, `config show`, `snapshots`, `fsck`, `rollback --list` |
+| **Network / API key required** | `install`, `track`, `update`, `check`, `scan`, `info`, `config verify`, `doctor`, `nxm`, `fsck --with-api` |
+
+### JSON output
+
+Three commands emit machine-readable JSON when passed `--json`:
+
+**`nexmod list <game> --json`** — full DB row per tracked mod:
+```json
+[{"id":1,"game":"darktide","mod_id":1234,"name":"Some Mod","version":"1.2.3","file_id":5678,...}]
+```
+
+**`nexmod check <game> --json`** — staleness check per mod, no downloads:
+```json
+[{"game":"darktide","mod_id":1234,"name":"Some Mod","installed":"1.2.3","latest":"1.3.0","update_available":true,"error":null}]
+```
+
+**`nexmod update <game> --json`** — full update run (implies `--yes`), structured result:
+```json
+{
+  "game": "darktide",
+  "updated":  [{"mod_id":1234,"name":"Some Mod","from":"1.2.3","to":"1.3.0"}],
+  "current":  [{"mod_id":5678,"name":"Other Mod","version":"2.0.0"}],
+  "failed":   [],
+  "load_order":{"written":true,"cycles":[],"drift_detected":false}
+}
+```
+
+### Direct DB access
+
+Read `~/.local/share/nexmod/mods.db` directly — WAL mode makes concurrent readers safe while nexmod is running:
+
+```bash
+# All tracked mods for a game
+sqlite3 ~/.local/share/nexmod/mods.db \
+  "SELECT mod_id, name, version FROM mods WHERE game='darktide'"
+
+# Find mods with no recorded version (Vortex imports — need an update run)
+sqlite3 ~/.local/share/nexmod/mods.db \
+  "SELECT mod_id, name FROM mods WHERE game='darktide' AND version IS NULL"
+```
+
+Schema: `mods(id, game, mod_id, file_id, name, version, filename, mod_dir, folder_name, tracked_at, updated_at)`
+
+### Non-interactive flags
+
+- `update --yes` / `-y` — skip per-mod confirmation
+- `update --json` — implies `--yes`; never prompts
+- `remove --yes` — skip purge confirmation
+- `rollback --yes` — skip rollback confirmation
+- `install --dry-run`, `remove --dry-run` — no changes made
+- `doctor` — exits 1 on required-check failure, 0 on warning-only
+
+### Idempotency
+
+`track`, `scan`, `path set`, `fsck --fix`, `nxm-register` are safe to re-run. `install` re-extracts and bumps `updated_at`. `profile save` overwrites without prompt only with `-f`.
+
+### Resilience
+
+`nexus_get` and `download_file` retry transient errors with exponential backoff and honor `Retry-After` on 429. Callers don't need to retry. Tune via env vars:
+
+| Variable | Default | Effect |
+|----------|---------|--------|
+| `NEXMOD_API_RETRIES` | `3` | Max retry attempts per request |
+| `NEXMOD_API_RETRY_DELAY` | `1.0` | Base backoff delay (seconds) |
+| `NEXMOD_429_MAX_WAIT` | `60.0` | Cap on Retry-After sleep |
+
+### Load order directives
+
+Place these as comments in `mod_load_order.txt` to control reconcile behavior:
+
+| Directive | Effect |
+|-----------|--------|
+| `# NEXMOD:freeze` | nexmod will never modify this file while the directive is present |
+| `# NEXMOD:framework ModName` | Pin `ModName` before all non-framework entries (DMF-style core mods) |
+| `# NEXMOD:pin:top ModName` | Force `ModName` to top of managed section |
+| `# NEXMOD:pin:bottom ModName` | Force `ModName` to bottom |
+| `# NEXMOD:pin:before Target ModName` | Place `ModName` immediately before `Target` |
+| `# NEXMOD:pin:after Target ModName` | Place `ModName` immediately after `Target` |
+
+Manage pins via `nexmod pin` / `nexmod unpin` / `nexmod pins <game>` rather than editing the file manually.
 
 ---
 

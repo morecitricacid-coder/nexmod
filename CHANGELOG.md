@@ -6,6 +6,20 @@ All notable changes to nexmod are documented here. Format follows
 
 ---
 
+## [Unreleased]
+
+### Added
+
+- `nexmod check <game> --json` — machine-readable staleness check; emits one object per mod with `mod_id`, `installed`, `latest`, `update_available`, `error`
+- `nexmod update <game> --json` — machine-readable update run; implies `--yes`; emits `updated`/`current`/`failed`/`load_order` summary object
+- `doctor` now prints a "→ Next:" hint after a clean pass
+
+### Fixed
+
+- README "From source" install used `pip install -e . --user`; corrected to `pip install -e ".[dev]"` so dev dependencies (pytest, responses) are included
+
+---
+
 ## [0.3.0] — Public-Readiness Hardening
 
 Pre-launch hardening pass before nexmod becomes a public PyPI package.
