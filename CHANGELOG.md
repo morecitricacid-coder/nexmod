@@ -10,6 +10,9 @@ All notable changes to nexmod are documented here. Format follows
 
 ### Added
 
+- `nexmod setup` — interactive first-run wizard: prompts for API key, auto-scans Steam for all supported games (or a single `--game <slug>`), and runs `doctor` to confirm the environment. Use `--reset` to re-enter an existing key.
+- Interactive game path prompt on unknown or undetected games in `resolve_mod_dir`: when stdin/stdout are TTYs, nexmod prompts the user to enter a path instead of exiting immediately. Non-interactive callers (cron, scripts, pipes) still get a hard exit with a clear `nexmod path set` hint.
+- Inline dep install prompt in `--fix-deps`: a `[Y/n]` gate now appears before each missing dep, and the DB is queried by `folder_name` before prompting for a URL — known mods install directly without requiring a Nexus URL.
 - `nexmod check <game> --json` — machine-readable staleness check; emits one object per mod with `mod_id`, `installed`, `latest`, `update_available`, `error`
 - `nexmod update <game> --json` — machine-readable update run; implies `--yes`; emits `updated`/`current`/`failed`/`load_order` summary object
 - `doctor` now prints a "→ Next:" hint after a clean pass

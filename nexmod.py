@@ -143,6 +143,18 @@ def get_auto_reorder() -> bool:
     return load_config().get("auto_reorder", True)
 
 
+def _is_interactive() -> bool:
+    """True only when both stdin and stdout are real TTYs.
+
+    Used to gate interactive prompts: CLI paths reachable from cron, systemd,
+    pipes, or test runners must fall back to non-interactive behavior.
+    """
+    try:
+        return sys.stdin.isatty() and sys.stdout.isatty()
+    except (AttributeError, ValueError):
+        return False
+
+
 # ── Database ──────────────────────────────────────────────────────────────────
 
 def get_db() -> sqlite3.Connection:
@@ -873,9 +885,28 @@ def resolve_mod_dir(game: str, db: sqlite3.Connection) -> Path:
 
     info = GAMES.get(game)
     if not info:
-        console.print(f"[red]Unknown game '{game}'. Run 'nexmod games' to list supported games.[/red]")
-        console.print(f"Or set a custom path: nexmod path set {game} /path/to/mod/dir")
-        sys.exit(1)
+        if not _is_interactive():
+            console.print(f"[red]Unknown game '{game}'. Run 'nexmod games' to list supported games.[/red]")
+            console.print(f"Or set a custom path: nexmod path set {game} /path/to/mod/dir")
+            sys.exit(1)
+        # Interactive: prompt for manual path
+        entered = click.prompt(
+            f"Unknown game '{game}'. Enter the mod directory path to register it, or press Enter to cancel",
+            default="",
+            show_default=False,
+        )
+        if not entered.strip():
+            console.print("[dim]Cancelled.[/dim]")
+            sys.exit(0)
+        path = Path(entered.strip()).expanduser().resolve()
+        if not path.exists():
+            console.print(f"[yellow]⚠ Path does not exist: {path}[/yellow]")
+            if not click.confirm("Register it anyway?", default=False):
+                sys.exit(0)
+        db.execute("INSERT OR REPLACE INTO game_paths (game, path) VALUES (?, ?)", (game, str(path)))
+        db.commit()
+        console.print(f"[green]Registered:[/green] {game} → {path}")
+        return path
 
     game_path = find_game_install(info["steam_id"])
     if game_path:
@@ -885,9 +916,28 @@ def resolve_mod_dir(game: str, db: sqlite3.Connection) -> Path:
         console.print(f"[dim]Auto-detected: {mod_dir}[/dim]")
         return mod_dir
 
-    console.print(f"[yellow]Could not find {info['name']} Steam install.[/yellow]")
-    console.print(f"Set it manually: nexmod path set {game} /path/to/{info['mod_subdir']}")
-    sys.exit(1)
+    if not _is_interactive():
+        console.print(f"[yellow]Could not find {info['name']} Steam install.[/yellow]")
+        console.print(f"Set it manually: nexmod path set {game} /path/to/{info['mod_subdir']}")
+        sys.exit(1)
+    # Interactive: prompt for manual path
+    entered = click.prompt(
+        f"Can't find {info['name']} Steam install. Enter path manually, or press Enter to skip",
+        default="",
+        show_default=False,
+    )
+    if not entered.strip():
+        console.print("[dim]Skipping.[/dim]")
+        sys.exit(0)
+    path = Path(entered.strip()).expanduser().resolve()
+    if not path.exists():
+        console.print(f"[yellow]⚠ Path does not exist: {path}[/yellow]")
+        if not click.confirm("Register it anyway?", default=False):
+            sys.exit(0)
+    db.execute("INSERT OR REPLACE INTO game_paths (game, path) VALUES (?, ?)", (game, str(path)))
+    db.commit()
+    console.print(f"[green]Registered:[/green] {game} → {path}")
+    return path
 
 
 # ── Load Order ───────────────────────────────────────────────────────────────
@@ -1054,6 +1104,7 @@ def _handle_missing_deps(
     mod_dir: Path,
     api_key: str,
     db: sqlite3.Connection,
+    yes: bool = False,
 ) -> bool:
     """Prompt the user to install any missing mod dependencies.
 
@@ -1084,10 +1135,31 @@ def _handle_missing_deps(
                 _ensure_load_order(mod_dir, load_order_file, [dep])
             continue
 
-        console.print(
-            f"\n[yellow]{declaring_mod}[/yellow] requires "
-            f"[bold]{dep}[/bold] which is not installed."
-        )
+        # Dep is missing from disk
+        console.print(f"  [yellow]⚠[/yellow] [bold]{declaring_mod}[/bold] requires [cyan]{dep}[/cyan] — not installed")
+        if yes or not _is_interactive():
+            # non-interactive: proceed to DB lookup / URL prompt without gating
+            pass
+        elif not click.confirm("  → Install it now?", default=True):
+            console.print(f"  [dim]Skipped. Install manually: nexmod install <nexus-url>[/dim]")
+            continue
+
+        # Try DB resolution first (folder_name → mod_id)
+        row = db.execute(
+            "SELECT mod_id, name FROM mods WHERE game=? AND folder_name=?",
+            (game, dep),
+        ).fetchone() if db is not None else None
+        if row:
+            console.print(f"  [dim]Found in DB → mod {row['mod_id']} ({row['name']})[/dim]")
+            try:
+                do_install(game, row["mod_id"], None, api_key, db)
+                any_installed = True
+            except Exception as e:
+                console.print(f"  [red]✗[/red] Install failed: {e}")
+            continue
+
+        # DB miss — prompt for URL
+        console.print(f"  [dim]'{dep}' not in local DB. Paste a Nexus URL to install it:[/dim]")
         url = click.prompt(
             f"  Paste the Nexus URL for '{dep}' to install it (Enter to skip)",
             default="",
@@ -1106,8 +1178,7 @@ def _handle_missing_deps(
                     f"installing for '{game}' instead.[/yellow]"
                 )
                 dep_game = game
-            dep_name, dep_ver = do_install(dep_game, dep_mod_id, dep_file_id, api_key, db)
-            console.print(f"  [green]✓ Installed dependency:[/green] {dep_name} v{dep_ver}")
+            do_install(dep_game, dep_mod_id, dep_file_id, api_key, db)
             any_installed = True
         except SystemExit:
             pass  # parse_nexus_url already printed the error
@@ -2519,10 +2590,11 @@ def path():
 def path_set(game, mod_dir):
     """Manually set the mod directory for GAME."""
     db = get_db()
-    db.execute("INSERT OR REPLACE INTO game_paths (game, path) VALUES (?, ?)", (game, mod_dir))
+    normalised = str(Path(mod_dir).expanduser().resolve())
+    db.execute("INSERT OR REPLACE INTO game_paths (game, path) VALUES (?, ?)", (game, normalised))
     db.commit()
-    log.info("mod dir for %s set to %s", game, mod_dir)
-    console.print(f"[green]{game} mod dir → {mod_dir}[/green]")
+    log.info("mod dir for %s set to %s", game, normalised)
+    console.print(f"[green]{game} mod dir → {normalised}[/green]")
 
 @path.command("show")
 @click.argument("game")
@@ -2545,6 +2617,95 @@ def games_list():
     for slug, info in GAMES.items():
         t.add_row(slug, info["name"], info["domain"])
     console.print(t)
+
+
+# setup ───────────────────────────────────────────────────────────────────────
+
+@cli.command("setup")
+@click.option("--game", default=None, help="Wizard-onboard a single game slug instead of all.")
+@click.option("--reset", is_flag=True, help="Re-prompt for API key even if one is already set.")
+@click.pass_context
+def setup_wizard(ctx, game, reset):
+    """Interactive first-run wizard: API key, game paths, then doctor check."""
+    if not _is_interactive():
+        console.print("[red]setup requires a terminal.[/red]")
+        console.print("For scripted setup use: nexmod config set-key && nexmod path set <game> <path>")
+        sys.exit(1)
+
+    console.rule("[bold cyan]nexmod setup[/bold cyan]")
+
+    # ── API key ───────────────────────────────────────────────────────────────
+    cfg = load_config()
+    existing_key = cfg.get("api_key", "")
+    if existing_key and not reset:
+        masked = f"{existing_key[:8]}…{existing_key[-4:]}"
+        console.print(f"[green]✓[/green] API key already set ({masked}). Use --reset to change it.")
+    else:
+        key = click.prompt("Nexus Mods API key", hide_input=True)
+        cfg["api_key"] = key.strip()
+        save_config(cfg)
+        console.print("[green]✓[/green] API key saved.")
+
+    # ── Game scan ─────────────────────────────────────────────────────────────
+    db = get_db()
+    targets = [game] if game else list(GAMES.keys())
+
+    console.print()
+    console.rule("[bold]Game paths[/bold]")
+
+    for slug in targets:
+        info = GAMES.get(slug)
+        if not info:
+            console.print(f"[yellow]Unknown game slug '{slug}' — skipping.[/yellow]")
+            continue
+
+        # Already registered?
+        row = db.execute("SELECT path FROM game_paths WHERE game=?", (slug,)).fetchone()
+        if row:
+            console.print(f"[green]✓[/green] {info['name']} — already registered at {row['path']}")
+            continue
+
+        # Try Steam auto-detect
+        game_path = find_game_install(info["steam_id"])
+        if game_path:
+            mod_path = game_path / info["mod_subdir"]
+            console.print(f"  Found [bold]{info['name']}[/bold] at {game_path}")
+            if click.confirm(f"  Manage it with nexmod?", default=True):
+                db.execute(
+                    "INSERT OR REPLACE INTO game_paths (game, path) VALUES (?, ?)",
+                    (slug, str(mod_path)),
+                )
+                db.commit()
+                console.print(f"  [green]✓[/green] Registered: {slug} → {mod_path}")
+            else:
+                console.print(f"  [dim]Skipped {slug}.[/dim]")
+        else:
+            console.print(f"  [yellow]Could not find {info['name']} Steam install.[/yellow]")
+            entered = click.prompt(
+                f"  Enter mod directory path manually, or press Enter to skip",
+                default="",
+                show_default=False,
+            )
+            if not entered.strip():
+                console.print(f"  [dim]Skipped {slug}.[/dim]")
+                continue
+            path = Path(entered.strip()).expanduser().resolve()
+            if not path.exists():
+                console.print(f"  [yellow]⚠ Path does not exist: {path}[/yellow]")
+                if not click.confirm("  Register it anyway?", default=False):
+                    console.print(f"  [dim]Skipped {slug}.[/dim]")
+                    continue
+            db.execute(
+                "INSERT OR REPLACE INTO game_paths (game, path) VALUES (?, ?)",
+                (slug, str(path)),
+            )
+            db.commit()
+            console.print(f"  [green]✓[/green] Registered: {slug} → {path}")
+
+    # ── Doctor check ──────────────────────────────────────────────────────────
+    console.print()
+    console.rule("[bold]Pre-flight check[/bold]")
+    ctx.invoke(doctor)
 
 
 # doctor ──────────────────────────────────────────────────────────────────────
@@ -2837,7 +2998,7 @@ def install(game, mod_id, file_id, no_reorder, dry_run):
         if result["cycles"]:
             console.print(f"  [yellow]Dependency cycle detected: {', '.join(result['cycles'])}[/yellow]")
         if result["missing_deps"]:
-            newly = _handle_missing_deps(game, result["missing_deps"], mod_dir, api_key, db)
+            newly = _handle_missing_deps(game, result["missing_deps"], mod_dir, api_key, db, yes=False)
             if newly:
                 # Fresh reconcile after dep installs (do_install already ran reconcile
                 # for each dep, but a final pass ensures topo order is canonical).
@@ -3533,7 +3694,7 @@ def update_mods(game, mod_id, yes, no_reorder, fix_deps, output_json):
                 console.print("[yellow]Load order: external edit detected — not modified.[/yellow]")
         if result["missing_deps"]:
             if fix_deps:
-                newly = _handle_missing_deps(game, result["missing_deps"], mod_dir, api_key, db)
+                newly = _handle_missing_deps(game, result["missing_deps"], mod_dir, api_key, db, yes=yes)
                 if newly:
                     reconcile_load_order(game, db, mod_dir)
             elif not output_json:

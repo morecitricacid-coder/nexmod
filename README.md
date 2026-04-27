@@ -84,6 +84,10 @@ bash install.sh
 ## Quick Start
 
 ```bash
+# 0. First-time setup: API key + Steam game scan + pre-flight check in one step
+nexmod setup
+
+# If you prefer manual setup:
 # 1. Get your API key: nexusmods.com → avatar → Settings → API Keys
 nexmod config set-key <your-key>
 
