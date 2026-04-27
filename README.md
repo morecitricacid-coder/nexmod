@@ -9,15 +9,23 @@ A Linux-native CLI mod manager for [Nexus Mods](https://www.nexusmods.com/).
 ## Features
 
 - Install / track / update mods by **mod ID *or* full Nexus URL**
+- **`nxm://` link handler** — register once, then click "Mod Manager Download" on any Nexus mod page
+- **Rollback** — every install/update is snapshotted; one command restores the previous version
 - Named **profiles** for hotswapping load orders (e.g. `minimal` ↔ `full`)
 - Dependency-aware load-order sorting (reads `mod.json` and `<folder>.mod`)
 - **Robust `mod_load_order.txt` management** — orphan detection, foreign-entry preservation, framework auto-pinning, atomic writes with backup, external-edit drift detection, in-file `nexmod:freeze` directive
 - **Pin folders** to top/bottom or relative to other folders — pins persist in the DB and survive every reconcile
 - **Missing-dependency detection** — every `nexmod update` scans the inventory; `--fix-deps` installs the gaps interactively
+- **Conflict detection** — peeks archives before extracting; warns when a mod would overwrite another tracked mod's folder
+- **Network resilience** — Range-resume on download interruption, retries with exponential backoff, honors `Retry-After` on 429, falls back across CDN mirrors
+- **Pre-flight `nexmod doctor`** — verifies API + Premium + Steam + Wine + 7z + disk + DB before you install anything
+- **`nexmod fsck`** — audits and repairs DB drift (legacy rows missing `folder_name`, version mismatches)
 - Vortex import — reads `vortex.deployment.json`, no re-downloads
 - Steam (native + Flatpak) and Wine/Proton paths auto-detected
 - Atomic downloads with MD5 verification before extraction
 - `.zip`, `.tar.gz`, `.tar.bz2`, `.tar.xz`, `.7z` archives supported
+- Disk-space pre-check before download/extract
+- Path-traversal protection (rejects `../` and absolute paths in archives)
 - Darktide: enable/disable mod loading via dtkit-patch through Wine
 - `diag` surfaces mod errors from the game's own log
 - Full operation history in a local SQLite DB; no telemetry, no daemons
@@ -74,21 +82,28 @@ bash install.sh
 # 1. Get your API key: nexusmods.com → avatar → Settings → API Keys
 nexmod config set-key <your-key>
 
-# 2. Confirm your account is Premium
-nexmod config verify
+# 2. Verify everything's wired up (API, Premium, Steam, Wine, 7z, disk, ...)
+nexmod doctor
 
-# 3a. Install by URL (any Nexus mod page works)
+# 3. (optional) Register the nxm:// handler so the "Mod Manager Download"
+#     button on Nexus mod pages launches nexmod automatically.
+nexmod nxm-register
+
+# 4a. Install by URL (any Nexus mod page works)
 nexmod install https://www.nexusmods.com/warhammer40kdarktide/mods/1234
 
-# 3b. Or by slug + ID
+# 4b. Or by slug + ID
 nexmod install darktide 1234
 
-# 4. List, check, update
+# 5. List, check, update
 nexmod list darktide
 nexmod check darktide
 nexmod update darktide -y
 
-# 5. Snapshot the current load order, then hotswap later
+# 6. If a new version breaks the mod, roll back to the previous snapshot.
+nexmod rollback darktide 1234
+
+# 7. Snapshot the current load order, then hotswap later
 nexmod profile save darktide minimal -d "QoL only"
 nexmod profile save darktide full
 nexmod profile load darktide minimal     # apply minimal
@@ -112,11 +127,11 @@ nexmod profile load darktide full        # back to full
 
 | Command | Flags | Description |
 |---------|-------|-------------|
-| `nexmod install <game> <mod_id>` | `--file-id N`, `--no-reorder` | Download, extract, track. Accepts a Nexus URL in place of `<game> <mod_id>`. |
+| `nexmod install <game> <mod_id>` | `--file-id N`, `--no-reorder`, `--dry-run` | Download, extract, track. Accepts a Nexus URL in place of `<game> <mod_id>`. `--dry-run` resolves metadata + prints what would happen without fetching. Conflict detection: if the archive's top-level folder is already claimed by another tracked mod, you'll be prompted before overwriting. |
 | `nexmod install <nexus-url>` | (same) | URL form — game and mod ID parsed from the URL. |
 | `nexmod track <game> <mod_id>` | — | Record an already-installed mod for update tracking. URL form supported. |
 | `nexmod scan <game>` | `--dry-run` | Import all mods from `vortex.deployment.json`. |
-| `nexmod remove <game> <mod_id>` | `--purge` | Untrack. `--purge` also deletes the mod folder. |
+| `nexmod remove <game> <mod_id>` | `--purge`, `--yes`, `--dry-run`, `--force-legacy-purge` | Untrack. `--purge` also deletes the mod folder (with confirmation; `--yes` skips). Rows missing `folder_name` (legacy installs) refuse to purge unless `--force-legacy-purge` is set — run `nexmod fsck --fix` first. |
 
 ### Updates
 
@@ -192,6 +207,28 @@ The reconciler parses these `--`-prefixed comment directives and re-emits them o
 
 Pins set via `nexmod pin` go into the DB; pins via directives go in the file. Both are honored.
 
+### Rollback & snapshots
+
+| Command | Flags | Description |
+|---------|-------|-------------|
+| `nexmod snapshots <game> [<mod_id>]` | `--prune` | List cached version snapshots. With `--prune`, force-trims each mod to the most-recent `SNAPSHOTS_PER_MOD` (default 3). |
+| `nexmod rollback <game> <mod_id>` | `--version V`, `--list`, `--yes` | Restore a tracked mod from a cached snapshot. Defaults to the most-recent prior version; `--version` picks a specific one; `--list` shows what's available without restoring. |
+
+Snapshots are written automatically after every successful install/update to
+`~/.cache/nexmod/<game>/<mod_id>/<version>.<ext>` and capped to the most-recent
+`SNAPSHOTS_PER_MOD` per mod (override via the `NEXMOD_SNAPSHOTS_PER_MOD` env var).
+
+### NXM links
+
+| Command | Description |
+|---------|-------------|
+| `nexmod nxm-register` | Write `~/.local/share/applications/nexmod-nxm.desktop` and register it via `xdg-mime` as the system handler for `nxm://` links. |
+| `nexmod nxm-unregister` | Remove the registration. |
+| `nexmod nxm <uri>` | Manually handle an `nxm://` URI. Usually invoked by the system handler after registration; safe to paste a URI yourself. |
+
+After `nxm-register`, clicking "Mod Manager Download" on any Nexus mod page
+launches nexmod and starts the install.
+
 ### Mod loader (Darktide)
 
 | Command | Description |
@@ -204,6 +241,8 @@ Pins set via `nexmod pin` go into the DB; pins via directives go in the file. Bo
 
 | Command | Flags | Description |
 |---------|-------|-------------|
+| `nexmod doctor` | `--game <slug>` | Pre-flight environment check: API key + Premium, Steam libraries, per-game install paths, Wine + 7z presence, disk space, DB integrity. Exits 1 if any required check fails; warnings are advisory. |
+| `nexmod fsck [<game>]` | `--fix`, `--with-api` | Audit the local DB. Reports legacy rows missing `folder_name` and version. With `--fix`, auto-backfills folder names by 4-strategy inference (filename stem → mod.json name → .mod title → fuzzy match), refusing collisions. With `--with-api --fix`, also re-fetches missing version strings from Nexus. |
 | `nexmod path set <game> <dir>` | — | Override auto-detected mod directory. |
 | `nexmod path show <game>` | — | Print the resolved mod directory. |
 | `nexmod diag <game>` | `--lines N`, `--all` | Surface mod errors from the game's own log file. |
@@ -240,6 +279,19 @@ Output when something's missing:
 ```
 
 The default is report-only because `--yes` automation contexts (cron, scripts) shouldn't block on a Nexus URL prompt.
+
+### Recover from a bad update
+
+```bash
+nexmod update darktide -y                       # mod ID 1234 ships v1.2 — breaks something
+nexmod snapshots darktide 1234                  # see what versions are cached
+nexmod rollback darktide 1234                   # restore most recent prior version
+# or pin a specific version:
+nexmod rollback darktide 1234 --version 1.0
+```
+
+Snapshots are saved automatically after every install/update; you don't need
+to opt in. The cache caps to 3 versions per mod by default.
 
 ### Hotswap load orders
 
@@ -296,6 +348,19 @@ The JSON shape is one object per `mods` row:
 | Database (SQLite, WAL) | `~/.local/share/nexmod/mods.db` |
 | Log (rotating, 5 MB × 3) | `~/.local/share/nexmod/nexmod.log` |
 | Wine prefix (dtkit) | `~/.local/share/nexmod/wine-prefix` |
+| Snapshot cache (rollback) | `~/.cache/nexmod/<game>/<mod_id>/<version>.<ext>` |
+| NXM handler (after `nxm-register`) | `~/.local/share/applications/nexmod-nxm.desktop` |
+
+### Tunable env vars
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `NEXMOD_API_RETRIES` | `3` | Total attempts for `nexus_get` requests |
+| `NEXMOD_API_RETRY_DELAY` | `1.0` | Base delay (seconds) for exponential backoff |
+| `NEXMOD_429_MAX_WAIT` | `60.0` | Cap on `Retry-After` honored on HTTP 429 |
+| `NEXMOD_DOWNLOAD_RETRIES` | `3` | Total attempts for `download_file` (with Range-resume) |
+| `NEXMOD_SNAPSHOTS_PER_MOD` | `3` | Max snapshots kept per mod in rollback cache |
+| `XDG_CACHE_HOME` | `~/.cache` | Base for snapshot cache directory |
 
 The SQLite DB is safe to read concurrently while nexmod is running — WAL is enabled. Schema:
 
@@ -320,12 +385,14 @@ The SQLite DB is safe to read concurrently while nexmod is running — WAL is en
 
 ## For Automation / LLMs
 
-- **Read-only / no-network commands:** `list`, `list --json`, `history`, `logs`, `path show`, `games`, `profile list`, `profile show`, `config show`. Safe to invoke without an API key.
-- **Network / API key required:** `install`, `track`, `update`, `check`, `scan`, `info`, `config verify`.
+- **Read-only / no-network commands:** `list`, `list --json`, `history`, `logs`, `path show`, `games`, `profile list`, `profile show`, `config show`, `snapshots`, `fsck` (without `--fix`), `rollback --list`. Safe to invoke without an API key.
+- **Network / API key required:** `install`, `track`, `update`, `check`, `scan`, `info`, `config verify`, `doctor`, `nxm`, `fsck --with-api`.
 - **Inspect state without parsing CLI output:** read `~/.local/share/nexmod/mods.db` directly. WAL mode means concurrent readers are fine.
 - **Stable JSON contract:** `nexmod list <game> --json` (full DB row per mod). Other commands do not yet emit JSON — expect Rich-formatted tables.
-- **Idempotency:** `track`, `scan`, `path set` are safe to re-run. `install` re-extracts and bumps `updated_at`. `profile save` overwrites without prompt only with `-f`.
+- **Idempotency:** `track`, `scan`, `path set`, `fsck --fix`, `nxm-register` are safe to re-run. `install` re-extracts and bumps `updated_at`. `profile save` overwrites without prompt only with `-f`.
+- **Non-interactive flags:** `update -y`, `remove --yes`, `rollback --yes` skip confirmations. `install --dry-run` and `remove --dry-run` make no changes. `nexmod doctor` exits 1 on any required-check failure (warnings still exit 0).
 - **Determining freshness:** `version IS NULL` means scanned-but-not-yet-updated (Vortex import); a normal `update` will pull the current Nexus version.
+- **Network resilience is automatic:** clients don't need to retry — `nexus_get` and `download_file` retry transient errors internally with exponential backoff and respect `Retry-After`. Tune via env vars (see Configuration).
 
 ---
 
