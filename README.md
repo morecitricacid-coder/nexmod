@@ -11,6 +11,8 @@ A Linux-native CLI mod manager for [Nexus Mods](https://www.nexusmods.com/).
 - Install / track / update mods by **mod ID *or* full Nexus URL**
 - Named **profiles** for hotswapping load orders (e.g. `minimal` ↔ `full`)
 - Dependency-aware load-order sorting (reads `mod.json` and `<folder>.mod`)
+- **Robust `mod_load_order.txt` management** — orphan detection, foreign-entry preservation, framework auto-pinning, atomic writes with backup, external-edit drift detection, in-file `nexmod:freeze` directive
+- **Pin folders** to top/bottom or relative to other folders — pins persist in the DB and survive every reconcile
 - **Missing-dependency detection** — every `nexmod update` scans the inventory; `--fix-deps` installs the gaps interactively
 - Vortex import — reads `vortex.deployment.json`, no re-downloads
 - Steam (native + Flatpak) and Wine/Proton paths auto-detected
@@ -140,7 +142,7 @@ nexmod profile load darktide full        # back to full
 | `nexmod profile save <game> <name>` | `-d/--description`, `-f/--force` | Snapshot the current load order. |
 | `nexmod profile list <game>` | — | Show all saved profiles. |
 | `nexmod profile show <game> <name>` | — | Print a profile's full mod list (flags missing-from-disk). |
-| `nexmod profile load <game> <name>` | `--dry-run`, `--install` | Apply a profile. `--install` installs profile mods missing from disk via their tracked mod_id. |
+| `nexmod profile load <game> <name>` | `--dry-run`, `--install`, `--strict` | Apply a profile. `--install` installs profile mods missing from disk via their tracked mod_id. `--strict` also drops foreign (untracked) entries — default preserves them. |
 | `nexmod profile delete <game> <name>` | `-f/--force` | Delete a profile. |
 | `nexmod profile rename <game> <old> <new>` | — | Rename a profile. |
 
@@ -148,7 +150,47 @@ nexmod profile load darktide full        # back to full
 
 | Command | Flags | Description |
 |---------|-------|-------------|
-| `nexmod order <game>` | `--dry-run` | Sort `mod_load_order.txt` topologically by declared deps. Cycles → end. |
+| `nexmod order <game>` | `--dry-run`, `--check`, `--fsck`, `--freeze`, `--unfreeze`, `--adopt`, `--auto-merge` | Reconcile `mod_load_order.txt` against DB + disk + pins. |
+| `nexmod pin <game> <folder> top\|bottom\|before\|after [other]` | — | Pin a folder to a load-order position. |
+| `nexmod unpin <game> <folder>` | — | Remove a pin. |
+| `nexmod pins <game>` | — | List active pins. |
+
+**`order` flags:**
+
+| Flag | What it does |
+|------|--------------|
+| `--check` | Print classification table + diff. No write. |
+| `--dry-run` | Same, but quieter. |
+| `--fsck` | Restore from `.bak` (kept by every reconcile). |
+| `--freeze` | Insert `-- nexmod:freeze` directive. nexmod stops touching the file. |
+| `--unfreeze` | Remove the freeze directive. |
+| `--adopt` | Promote foreign (untracked) entries: prompts for a Nexus URL per entry. |
+| `--auto-merge` | Force overwrite even if external drift is detected. |
+
+### How the reconciler classifies entries
+
+| Class | Meaning | Action |
+|-------|---------|--------|
+| `framework` | Foreign + matches game's framework set (e.g. `mod_compat`, `dmf`) | Pin to top |
+| `managed-present` | Tracked in DB, folder on disk | Topo-sort by deps |
+| `foreign` | Folder on disk, not tracked | Preserve verbatim |
+| `managed-missing` | Tracked in DB, folder gone | Drop |
+| `orphan` | Listed in file, no folder, no DB row | Drop |
+
+### In-file directives
+
+The reconciler parses these `--`-prefixed comment directives and re-emits them on every write:
+
+```
+-- nexmod:freeze                          # disables nexmod auto-mutation
+-- nexmod:framework custom_framework_dir  # adds to the framework set (auto-pinned to top)
+-- nexmod:pin my_mod top                  # pin to top of file
+-- nexmod:pin my_mod bottom               # pin to bottom of file
+-- nexmod:pin my_mod before mod_compat    # pin immediately before another folder
+-- nexmod:pin my_mod after  dmf           # pin immediately after another folder
+```
+
+Pins set via `nexmod pin` go into the DB; pins via directives go in the file. Both are honored.
 
 ### Mod loader (Darktide)
 
@@ -257,9 +299,11 @@ The JSON shape is one object per `mods` row:
 
 The SQLite DB is safe to read concurrently while nexmod is running — WAL is enabled. Schema:
 
-- `mods(id, game, mod_id, file_id, name, version, filename, mod_dir, tracked_at, updated_at)` — one row per tracked mod, unique on `(game, mod_id)`
+- `mods(id, game, mod_id, file_id, name, version, filename, mod_dir, folder_name, tracked_at, updated_at)` — one row per tracked mod, unique on `(game, mod_id)`. `folder_name` is captured at install time and is required for reliable `remove --purge`; legacy rows backfill on the next install/update.
 - `game_paths(game, path)` — manual mod-dir overrides
 - `history(timestamp, action, game, mod_id, mod_name, version, status, detail)` — every install/update/scan/remove
+- `load_order_state(game, file_path, last_hash, last_written_at, frozen)` — sha256 of the load order at last write; used to detect external edits.
+- `load_order_pins(game, folder, position, relative_to, source, created_at)` — persistent pins set via `nexmod pin`.
 
 ---
 

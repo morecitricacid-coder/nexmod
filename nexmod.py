@@ -14,6 +14,10 @@ import sys
 import hashlib
 import logging
 import re
+import fcntl
+import tempfile
+import time
+import difflib
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from datetime import datetime, timezone
@@ -176,9 +180,72 @@ def get_db() -> sqlite3.Connection:
         );
         CREATE INDEX IF NOT EXISTS idx_history_game_ts
             ON history(game, timestamp);
+        CREATE TABLE IF NOT EXISTS load_order_state (
+            game            TEXT PRIMARY KEY,
+            file_path       TEXT NOT NULL,
+            last_hash       TEXT,
+            last_written_at TEXT,
+            frozen          INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE TABLE IF NOT EXISTS load_order_pins (
+            game        TEXT NOT NULL,
+            folder      TEXT NOT NULL,
+            position    TEXT NOT NULL CHECK(position IN ('top','bottom','before','after')),
+            relative_to TEXT,
+            source      TEXT NOT NULL DEFAULT 'user',
+            created_at  TEXT NOT NULL,
+            PRIMARY KEY (game, folder)
+        );
     """)
-    conn.commit()
+    _apply_migrations(conn)
     return conn
+
+
+# Schema migrations: append-only list. Each entry runs exactly once and is
+# recorded in schema_migrations. To change schema, ADD a new entry — never
+# reorder, never delete. Forward-fix instead.
+SCHEMA_MIGRATIONS: list[tuple[str, str]] = [
+    ("001_mods_folder_name", "ALTER TABLE mods ADD COLUMN folder_name TEXT"),
+]
+
+
+def _apply_migrations(conn: sqlite3.Connection) -> list[str]:
+    """Apply pending schema migrations. Returns names applied this call.
+
+    Idempotent: legacy schemas where the change already exists (from prior
+    defensive ALTER statements) are recorded as applied without re-running.
+    """
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS schema_migrations (
+            name       TEXT PRIMARY KEY,
+            applied_at TEXT NOT NULL
+        )
+    """)
+    applied = {r[0] for r in conn.execute("SELECT name FROM schema_migrations").fetchall()}
+    fresh: list[str] = []
+    for name, action in SCHEMA_MIGRATIONS:
+        if name in applied:
+            continue
+        try:
+            if callable(action):
+                action(conn)
+            else:
+                conn.execute(action)
+        except sqlite3.OperationalError as e:
+            # Legacy schema where column/table already exists from an earlier
+            # defensive ALTER. Record as applied so we don't retry forever.
+            msg = str(e).lower()
+            if "duplicate column" not in msg and "already exists" not in msg:
+                raise
+            log.info("migration %s already applied (legacy schema)", name)
+        conn.execute(
+            "INSERT INTO schema_migrations (name, applied_at) VALUES (?, ?)",
+            (name, now_iso()),
+        )
+        fresh.append(name)
+        log.info("migration applied: %s", name)
+    conn.commit()
+    return fresh
 
 def record(db: sqlite3.Connection, action: str, game: str, mod_id: int | None,
            mod_name: str | None, version: str | None, status: str, detail: str | None = None):
@@ -194,44 +261,112 @@ def record(db: sqlite3.Connection, action: str, game: str, mod_id: int | None,
 
 # ── Nexus API ─────────────────────────────────────────────────────────────────
 
+# Network resilience tunables. Override via env for tests/diagnostics.
+NEXUS_MAX_RETRIES = int(os.environ.get("NEXMOD_API_RETRIES", "3"))
+NEXUS_RETRY_BASE_DELAY = float(os.environ.get("NEXMOD_API_RETRY_DELAY", "1.0"))
+NEXUS_429_MAX_WAIT = float(os.environ.get("NEXMOD_429_MAX_WAIT", "60.0"))
+
+
+def _backoff_delay(attempt: int, base: float = NEXUS_RETRY_BASE_DELAY) -> float:
+    """Exponential backoff: base, base*2, base*4, ..."""
+    return base * (2 ** (attempt - 1))
+
+
 def nexus_get(endpoint: str, api_key: str) -> dict | list:
+    """GET a Nexus API endpoint with retry + 429 backoff.
+
+    Retries on transient errors (timeouts, connection drops, HTTP 5xx, 429).
+    Hard-fails (no retry) on 403/401/404 — those won't self-heal. 429 honors
+    Retry-After up to NEXUS_429_MAX_WAIT to avoid surprise long sleeps.
+    """
     url = f"{NEXUS_API}/{endpoint}"
     log.debug("GET %s", url)
-    try:
-        r = requests.get(
-            url,
-            headers={"apikey": api_key, "accept": "application/json"},
-            timeout=20,
-        )
-    except requests.exceptions.Timeout:
-        log.error("Timeout fetching %s", url)
-        console.print(f"[red]Timeout fetching {endpoint}[/red]")
-        sys.exit(1)
-    except requests.exceptions.ConnectionError as e:
-        log.error("Connection error: %s", e)
-        console.print(f"[red]Connection error: {e}[/red]")
-        sys.exit(1)
 
-    log.debug("→ HTTP %s  remaining=%s",
-              r.status_code, r.headers.get("X-RL-Daily-Remaining", "?"))
+    for attempt in range(1, NEXUS_MAX_RETRIES + 1):
+        try:
+            r = requests.get(
+                url,
+                headers={"apikey": api_key, "accept": "application/json"},
+                timeout=20,
+            )
+        except (requests.exceptions.Timeout,
+                requests.exceptions.ConnectionError) as e:
+            if attempt == NEXUS_MAX_RETRIES:
+                log.error("Network error after %d attempts on %s: %s", attempt, url, e)
+                console.print(f"[red]Network error after {attempt} attempts: {e}[/red]")
+                sys.exit(1)
+            delay = _backoff_delay(attempt)
+            log.warning("Attempt %d/%d failed (%s) — retrying in %.1fs",
+                        attempt, NEXUS_MAX_RETRIES, e.__class__.__name__, delay)
+            console.print(
+                f"  [yellow]Network blip ({e.__class__.__name__}) — retry "
+                f"{attempt}/{NEXUS_MAX_RETRIES} in {delay:.1f}s[/yellow]"
+            )
+            time.sleep(delay)
+            continue
 
-    if r.status_code == 429:
-        reset = r.headers.get("Retry-After", "unknown")
-        log.warning("Rate limited. Retry-After: %s", reset)
-        console.print(f"[yellow]Rate limited — retry after {reset}s[/yellow]")
-        sys.exit(1)
-    if r.status_code == 403:
-        log.error("403 Forbidden on %s: %s", url, r.text[:200])
-        console.print("[red]403 Forbidden — confirm your account has Nexus Premium.[/red]")
-        sys.exit(1)
-    if not r.ok:
-        snippet = r.text[:300]
-        log.error("HTTP %s on %s: %s", r.status_code, url, snippet)
-        console.print(f"[red]HTTP {r.status_code} from Nexus API[/red]")
-        console.print(f"[dim]{snippet}[/dim]")
-        r.raise_for_status()
+        log.debug("→ HTTP %s remaining=%s",
+                  r.status_code, r.headers.get("X-RL-Daily-Remaining", "?"))
 
-    return r.json()
+        # 429 — honor Retry-After (capped to NEXUS_429_MAX_WAIT)
+        if r.status_code == 429:
+            try:
+                wait = float(r.headers.get("Retry-After", "30"))
+            except ValueError:
+                wait = 30.0
+            wait = min(wait, NEXUS_429_MAX_WAIT)
+            if attempt == NEXUS_MAX_RETRIES:
+                hint = r.headers.get("Retry-After", "?")
+                log.error("Rate limited; %d retries exhausted (last Retry-After=%s)",
+                          attempt, hint)
+                console.print(
+                    f"[red]Rate limited — exhausted {attempt} retries. "
+                    f"Try again in {hint}s.[/red]"
+                )
+                sys.exit(1)
+            log.warning("Rate limited on attempt %d/%d — sleeping %.1fs",
+                        attempt, NEXUS_MAX_RETRIES, wait)
+            console.print(
+                f"  [yellow]Rate limited — sleeping {wait:.0f}s "
+                f"(attempt {attempt}/{NEXUS_MAX_RETRIES})[/yellow]"
+            )
+            time.sleep(wait)
+            continue
+
+        # 5xx — transient server error, retry
+        if 500 <= r.status_code < 600:
+            if attempt == NEXUS_MAX_RETRIES:
+                log.error("HTTP %s after %d attempts on %s", r.status_code, attempt, url)
+                console.print(
+                    f"[red]HTTP {r.status_code} from Nexus API after {attempt} retries[/red]"
+                )
+                sys.exit(1)
+            delay = _backoff_delay(attempt)
+            log.warning("HTTP %s on attempt %d/%d — retrying in %.1fs",
+                        r.status_code, attempt, NEXUS_MAX_RETRIES, delay)
+            console.print(
+                f"  [yellow]HTTP {r.status_code} — retry "
+                f"{attempt}/{NEXUS_MAX_RETRIES} in {delay:.1f}s[/yellow]"
+            )
+            time.sleep(delay)
+            continue
+
+        # 403/401/404 — hard fail, no retry (won't self-heal)
+        if r.status_code == 403:
+            log.error("403 Forbidden on %s: %s", url, r.text[:200])
+            console.print("[red]403 Forbidden — confirm your account has Nexus Premium.[/red]")
+            sys.exit(1)
+        if not r.ok:
+            snippet = r.text[:300]
+            log.error("HTTP %s on %s: %s", r.status_code, url, snippet)
+            console.print(f"[red]HTTP {r.status_code} from Nexus API[/red]")
+            console.print(f"[dim]{snippet}[/dim]")
+            r.raise_for_status()
+
+        return r.json()
+
+    # Unreachable — every loop branch either returns or sys.exits.
+    sys.exit(1)
 
 def api_mod_info(domain: str, mod_id: int, api_key: str) -> dict:
     return nexus_get(f"games/{domain}/mods/{mod_id}.json", api_key)
@@ -314,42 +449,135 @@ def find_proton_appdata(steam_id: int) -> Path | None:
 
 # ── Download & Extract ────────────────────────────────────────────────────────
 
-def download_file(url: str, dest: Path) -> Path:
-    # Atomic: write to <dest>.part, rename on success. A killed/crashed
-    # process never leaves a half-written archive at the canonical path.
+DOWNLOAD_MAX_RETRIES = int(os.environ.get("NEXMOD_DOWNLOAD_RETRIES", "3"))
+
+
+def download_file(url: str, dest: Path, max_retries: int | None = None) -> Path:
+    """Stream-download to <dest>.part, then atomic rename.
+
+    Resumes from the .part file's current size on retry via HTTP Range. Server
+    may ignore Range and return 200 instead of 206 — we treat that as a fresh
+    restart (delete .part, start over). Atomic rename ensures the canonical
+    dest path never holds a partial archive.
+    """
+    if max_retries is None:
+        max_retries = DOWNLOAD_MAX_RETRIES
     log.debug("Downloading %s → %s", url, dest)
     part = dest.with_suffix(dest.suffix + ".part")
-    part.unlink(missing_ok=True)
-    try:
-        with requests.get(url, stream=True, timeout=120) as r:
-            r.raise_for_status()
-            total = int(r.headers.get("content-length", 0))
-            with Progress(
-                TextColumn("[bold cyan]{task.fields[filename]}"),
-                BarColumn(),
-                DownloadColumn(),
-                TransferSpeedColumn(),
-            ) as progress:
-                task = progress.add_task("dl", filename=dest.name, total=total or None)
-                with open(part, "wb") as f:
-                    for chunk in r.iter_content(chunk_size=65536):
-                        f.write(chunk)
-                        progress.advance(task, len(chunk))
-    except Exception as e:
-        part.unlink(missing_ok=True)
-        log.error("Download failed for %s: %s", url, e)
-        raise RuntimeError(f"Download failed: {e}") from e
 
-    actual_size = part.stat().st_size
-    if total and actual_size != total:
-        part.unlink(missing_ok=True)
-        msg = f"Size mismatch: expected {total} bytes, got {actual_size}"
-        log.error(msg)
-        raise RuntimeError(msg)
+    last_exc: Exception | None = None
+    for attempt in range(1, max_retries + 1):
+        existing = part.stat().st_size if part.exists() else 0
+        headers: dict[str, str] = {}
+        if existing > 0:
+            headers["Range"] = f"bytes={existing}-"
+            log.debug("Resuming from byte %d (attempt %d)", existing, attempt)
 
-    part.replace(dest)
-    log.debug("Downloaded %s (%d bytes)", dest.name, actual_size)
-    return dest
+        try:
+            with requests.get(url, stream=True, timeout=120, headers=headers) as r:
+                # If we asked for a range but server ignored it, restart fresh.
+                if existing > 0 and r.status_code == 200:
+                    log.warning("Server ignored Range header — restarting download")
+                    part.unlink(missing_ok=True)
+                    existing = 0
+                if r.status_code not in (200, 206):
+                    r.raise_for_status()
+
+                # Total size: 206 reports it in Content-Range "bytes a-b/total";
+                # 200 in Content-Length.
+                if r.status_code == 206:
+                    cr = r.headers.get("Content-Range", "")
+                    total = int(cr.split("/")[-1]) if "/" in cr and cr.split("/")[-1].isdigit() else 0
+                else:
+                    total = int(r.headers.get("content-length", 0))
+
+                mode = "ab" if existing > 0 else "wb"
+                with Progress(
+                    TextColumn("[bold cyan]{task.fields[filename]}"),
+                    BarColumn(),
+                    DownloadColumn(),
+                    TransferSpeedColumn(),
+                ) as progress:
+                    task = progress.add_task(
+                        "dl", filename=dest.name,
+                        total=total or None, completed=existing,
+                    )
+                    with open(part, mode) as f:
+                        for chunk in r.iter_content(chunk_size=65536):
+                            f.write(chunk)
+                            progress.advance(task, len(chunk))
+
+            actual_size = part.stat().st_size
+            if total and actual_size != total:
+                # Could be premature EOF; retry by resuming from current size.
+                if attempt == max_retries:
+                    part.unlink(missing_ok=True)
+                    raise RuntimeError(
+                        f"Size mismatch after {attempt} attempts: "
+                        f"expected {total} bytes, got {actual_size}"
+                    )
+                log.warning("Size mismatch on attempt %d: %d/%d — retrying",
+                            attempt, actual_size, total)
+                continue
+
+            part.replace(dest)
+            log.debug("Downloaded %s (%d bytes)", dest.name, actual_size)
+            return dest
+
+        except (requests.exceptions.Timeout,
+                requests.exceptions.ConnectionError,
+                requests.exceptions.ChunkedEncodingError) as e:
+            # Transient — keep .part for resume on next attempt.
+            last_exc = e
+            if attempt == max_retries:
+                part.unlink(missing_ok=True)
+                log.error("Download failed for %s after %d attempts: %s", url, attempt, e)
+                raise RuntimeError(f"Download failed after {attempt} attempts: {e}") from e
+            delay = _backoff_delay(attempt)
+            log.warning("Download attempt %d/%d failed (%s) — resuming in %.1fs",
+                        attempt, max_retries, e.__class__.__name__, delay)
+            console.print(
+                f"  [yellow]Download blip — resuming in {delay:.1f}s "
+                f"({attempt}/{max_retries})[/yellow]"
+            )
+            time.sleep(delay)
+        except Exception as e:
+            # Non-transient (e.g., 403, 404, disk-full): no retry.
+            part.unlink(missing_ok=True)
+            log.error("Download failed for %s: %s", url, e)
+            raise RuntimeError(f"Download failed: {e}") from e
+
+    # Unreachable — loop either returns or raises.
+    raise RuntimeError(f"Download failed after {max_retries} attempts: {last_exc}")
+
+
+def _try_download_with_mirrors(urls: list, archive: Path) -> None:
+    """Try each mirror URL until one fully completes (with internal retries).
+
+    Nexus's download_link.json returns multiple CDN mirrors. download_file()
+    handles transient errors per-mirror; this layer handles whole-mirror
+    outages by trying the next one.
+    """
+    if not urls:
+        raise RuntimeError("No download URLs provided")
+    last_exc: Exception | None = None
+    for i, entry in enumerate(urls):
+        download_url = entry.get("URI") or entry.get("url")
+        if not download_url:
+            continue
+        try:
+            download_file(download_url, archive)
+            return
+        except Exception as e:
+            last_exc = e
+            short = entry.get("short_name") or f"mirror-{i+1}"
+            log.warning("Mirror %s failed: %s", short, e)
+            if i + 1 < len(urls):
+                console.print(
+                    f"  [yellow]Mirror '{short}' failed — trying next "
+                    f"({i + 2}/{len(urls)})[/yellow]"
+                )
+    raise RuntimeError(f"All {len(urls)} mirrors failed. Last error: {last_exc}")
 
 
 def verify_md5(path: Path, expected: str) -> None:
@@ -367,6 +595,169 @@ def verify_md5(path: Path, expected: str) -> None:
         log.error(msg)
         raise RuntimeError(msg)
     log.debug("MD5 verified for %s", path.name)
+
+
+# ── Snapshots / rollback cache ───────────────────────────────────────────────
+
+CACHE_DIR = Path(
+    os.environ.get("XDG_CACHE_HOME", str(Path.home() / ".cache"))
+) / "nexmod"
+SNAPSHOTS_PER_MOD = int(os.environ.get("NEXMOD_SNAPSHOTS_PER_MOD", "3"))
+
+
+def _snapshot_dir(game: str, mod_id: int) -> Path:
+    return CACHE_DIR / game / str(mod_id)
+
+
+def _safe_filename_part(s: str) -> str:
+    """Sanitize a string for use as a filename component (no / \\ : etc.)."""
+    return re.sub(r'[^\w.\-]', '_', s) if s else ""
+
+
+def _save_snapshot(game: str, mod_id: int, version: str | None,
+                   archive: Path) -> Path | None:
+    """Copy archive into the snapshot cache as <version>.<ext>.
+
+    Called after a successful install/update so a future `nexmod rollback`
+    can restore. Returns None when version is empty (we'd have nothing to
+    name the snapshot after) or when the source archive is missing. Prunes
+    oldest snapshots once over SNAPSHOTS_PER_MOD.
+    """
+    if not version or not archive.exists():
+        return None
+    snap_dir = _snapshot_dir(game, mod_id)
+    snap_dir.mkdir(parents=True, exist_ok=True)
+
+    # Preserve compound extensions (.tar.gz etc.) so re-extraction works.
+    name_lower = archive.name.lower()
+    ext = next(
+        (e for e in (".tar.gz", ".tar.bz2", ".tar.xz", ".tgz") if name_lower.endswith(e)),
+        archive.suffix or ".zip",
+    )
+    snap_path = snap_dir / f"{_safe_filename_part(version)}{ext}"
+    try:
+        shutil.copy2(archive, snap_path)
+    except OSError as e:
+        log.warning("snapshot copy failed: %s", e)
+        return None
+    log.info("snapshot saved: %s", snap_path)
+
+    _prune_snapshots(game, mod_id)
+    return snap_path
+
+
+def _prune_snapshots(game: str, mod_id: int) -> int:
+    """Keep only the SNAPSHOTS_PER_MOD newest snapshots. Returns # pruned."""
+    snap_dir = _snapshot_dir(game, mod_id)
+    if not snap_dir.exists():
+        return 0
+    files = sorted(
+        (p for p in snap_dir.iterdir() if p.is_file()),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    pruned = 0
+    for old in files[SNAPSHOTS_PER_MOD:]:
+        try:
+            old.unlink()
+            log.info("snapshot pruned: %s", old)
+            pruned += 1
+        except OSError as e:
+            log.warning("Could not prune snapshot %s: %s", old, e)
+    return pruned
+
+
+def _list_snapshots(game: str, mod_id: int) -> list[Path]:
+    """Return cached snapshots newest-first by mtime."""
+    snap_dir = _snapshot_dir(game, mod_id)
+    if not snap_dir.exists():
+        return []
+    return sorted(
+        (p for p in snap_dir.iterdir() if p.is_file()),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+
+
+def _snapshot_version_label(snap: Path) -> str:
+    """Strip compound extensions to recover the version label from filename."""
+    name = snap.name
+    for ext in (".tar.gz", ".tar.bz2", ".tar.xz", ".tgz"):
+        if name.lower().endswith(ext):
+            return name[: -len(ext)]
+    return snap.stem
+
+
+def _check_disk_space(path: Path, required_bytes: int, label: str) -> None:
+    """Raise RuntimeError if path's filesystem has < required_bytes free.
+
+    Pre-flight check before download/extract so users get an actionable error
+    upfront instead of a partial-state failure halfway through.
+    """
+    if required_bytes <= 0:
+        return
+    try:
+        usage = shutil.disk_usage(path)
+    except OSError as e:
+        log.warning("Could not check disk space at %s: %s", path, e)
+        return
+    if usage.free < required_bytes:
+        need_mb = required_bytes // (1024 * 1024)
+        free_mb = usage.free // (1024 * 1024)
+        raise RuntimeError(
+            f"Not enough disk space for {label}: need ~{need_mb} MB, "
+            f"have {free_mb} MB free at {path}"
+        )
+
+
+def _archive_top_level_dirs(archive: Path) -> list[str]:
+    """Peek at archive and return its top-level directory names.
+
+    Used for conflict detection before extraction. Returns [] for formats we
+    can't peek without extraction (7z) or on read errors — caller treats empty
+    as "no conflict info available, proceed."
+    """
+    name = archive.name.lower()
+    tops: set[str] = set()
+    try:
+        if name.endswith(".zip"):
+            with zipfile.ZipFile(archive) as zf:
+                for n in zf.namelist():
+                    parts = n.split("/")
+                    if parts[0]:
+                        tops.add(parts[0])
+        elif any(name.endswith(ext) for ext in
+                 (".tar.gz", ".tgz", ".tar.bz2", ".tar.xz", ".tar")):
+            with tarfile.open(archive) as tf:
+                for m in tf.getmembers():
+                    parts = m.name.split("/")
+                    if parts[0]:
+                        tops.add(parts[0])
+        # 7z would require subprocess invoke; skip — conflict detection is
+        # best-effort, not load-bearing.
+    except Exception as e:
+        log.warning("Could not peek archive %s: %s", archive.name, e)
+        return []
+    return sorted(tops)
+
+
+def _detect_install_conflicts(
+    db: sqlite3.Connection, game: str, mod_id: int, top_dirs: list[str]
+) -> list[tuple[str, str, int]]:
+    """Return [(folder, owner_name, owner_mod_id), ...] for any top-level dir
+    in the archive that's already tracked by a *different* mod in this game.
+
+    Catches the silent-overwrite case where two mods extract to the same folder.
+    """
+    if not top_dirs:
+        return []
+    placeholders = ",".join("?" * len(top_dirs))
+    rows = db.execute(
+        f"SELECT mod_id, name, folder_name FROM mods "
+        f"WHERE game = ? AND mod_id != ? AND folder_name IN ({placeholders})",
+        (game, mod_id, *top_dirs),
+    ).fetchall()
+    return [(r["folder_name"], r["name"], r["mod_id"]) for r in rows]
 
 
 def extract_archive(archive: Path, target_dir: Path):
@@ -763,24 +1154,66 @@ def do_install(game: str, mod_id: int, file_id_override: int | None,
 
     if not urls:
         raise RuntimeError("Nexus returned no download URLs — check your Premium status")
-    download_url = urls[0].get("URI") or urls[0].get("url")
-    if not download_url:
-        raise RuntimeError(f"Unexpected URL format from Nexus API: {urls[0]}")
     mod_dir = resolve_mod_dir(game, db)
     tmp = DATA_DIR / "tmp"
     tmp.mkdir(parents=True, exist_ok=True)
     archive = tmp / chosen["file_name"]
 
+    # Disk-space pre-flight. size_kb is the only size hint Nexus reliably
+    # exposes; allow a 50 MB buffer for the .part file overhead, and 3× for
+    # extraction headroom (compressed archives expand significantly).
+    size_kb = chosen.get("size_kb") or 0
+    if size_kb > 0:
+        size_bytes = size_kb * 1024
+        try:
+            _check_disk_space(tmp, size_bytes + 50 * 1024 * 1024, "download")
+            if mod_dir.exists():
+                _check_disk_space(mod_dir, size_bytes * 3, "extraction")
+        except RuntimeError as e:
+            record(db, "install", game, mod_id, mod["name"], mod.get("version"), "fail", str(e))
+            raise
+
     dirs_before = {p.name for p in mod_dir.iterdir() if p.is_dir()} if mod_dir.exists() else set()
 
     extraction_ok = False
     try:
-        download_file(download_url, archive)
+        _try_download_with_mirrors(urls, archive)
         if chosen.get("md5"):
             verify_md5(archive, chosen["md5"])
+
+        # Conflict detection: peek archive contents and warn if any top-level
+        # folder is already claimed by a different tracked mod. Best-effort
+        # (returns [] for 7z and read errors — extraction will still happen
+        # and overwrite, matching legacy behavior in those cases).
+        top_dirs = _archive_top_level_dirs(archive)
+        conflicts = _detect_install_conflicts(db, game, mod_id, top_dirs)
+        if conflicts:
+            console.print(
+                f"\n[yellow]⚠ Archive contains folders already claimed by other tracked mods:[/yellow]"
+            )
+            for folder, other_name, other_id in conflicts:
+                console.print(
+                    f"  [yellow]{folder}/[/yellow] is owned by [cyan]{other_name}[/cyan] (mod {other_id})"
+                )
+            console.print("  Continuing will overwrite those mods' files.")
+            if not click.confirm("Continue?", default=False):
+                console.print("[dim]Aborted.[/dim]")
+                record(db, "install", game, mod_id, mod["name"], mod.get("version"),
+                       "skip", f"conflict with mods: {','.join(str(c[2]) for c in conflicts)}")
+                raise click.Abort()
+
         console.print(f"  Extracting to [dim]{mod_dir}[/dim]...")
         extract_archive(archive, mod_dir)
         extraction_ok = True
+        # Save rollback snapshot before the finally clause unlinks the archive.
+        # Best-effort: failures here don't fail the install — user just has
+        # one fewer rollback target.
+        try:
+            _save_snapshot(game, mod_id, mod.get("version"), archive)
+        except Exception as e:
+            log.warning("snapshot save failed: %s", e)
+    except click.Abort:
+        raise
     except Exception as e:
         record(db, "install", game, mod_id, mod["name"], mod.get("version"), "fail", str(e))
         raise
@@ -790,25 +1223,57 @@ def do_install(game: str, mod_id: int, file_id_override: int | None,
     if not extraction_ok:
         raise RuntimeError("Extraction did not complete — DB not written")
 
-    load_order_file = (info or {}).get("load_order_file")
-    if load_order_file:
-        new_dirs = sorted({p.name for p in mod_dir.iterdir() if p.is_dir()} - dirs_before)
-        added = _ensure_load_order(mod_dir, load_order_file, new_dirs)
-        if added:
-            console.print(f"  [dim]mod_load_order.txt ← {', '.join(added)}[/dim]")
-        elif new_dirs:
-            console.print(f"  [dim]mod_load_order.txt: {', '.join(new_dirs)} already listed[/dim]")
+    new_dirs = sorted({p.name for p in mod_dir.iterdir() if p.is_dir()} - dirs_before)
+    # Multi-folder mods (rare but real — e.g., DMF ships dmf + mod_compat) get
+    # the alphabetically-first folder recorded as the primary; --purge will
+    # only delete that one. Surface the others so the user knows.
+    if len(new_dirs) > 1:
+        console.print(
+            f"  [yellow]Multi-folder install:[/yellow] {len(new_dirs)} new folders — "
+            f"primary tracked as [cyan]{new_dirs[0]}[/cyan]; siblings: "
+            f"{', '.join(new_dirs[1:])}"
+        )
+        log.info("Multi-folder install for mod_id=%s: %s", mod_id, new_dirs)
+    folder_name = new_dirs[0] if new_dirs else None
 
     db.execute("""
-        INSERT OR REPLACE INTO mods
-            (game, mod_id, file_id, name, version, filename, mod_dir, tracked_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO mods
+            (game, mod_id, file_id, name, version, filename, mod_dir,
+             folder_name, tracked_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(game, mod_id) DO UPDATE SET
+            file_id     = excluded.file_id,
+            name        = excluded.name,
+            version     = excluded.version,
+            filename    = excluded.filename,
+            mod_dir     = excluded.mod_dir,
+            folder_name = COALESCE(excluded.folder_name, mods.folder_name),
+            updated_at  = excluded.updated_at
     """, (
         game, mod_id, chosen["file_id"], mod["name"], mod.get("version"),
-        chosen["file_name"], str(mod_dir), now_iso(), now_iso(),
+        chosen["file_name"], str(mod_dir), folder_name, now_iso(), now_iso(),
     ))
     db.commit()
     record(db, "install", game, mod_id, mod["name"], mod.get("version"), "ok")
+
+    load_order_file = (info or {}).get("load_order_file")
+    if load_order_file:
+        try:
+            result = reconcile_load_order(game, db, mod_dir)
+            if new_dirs and result["written"]:
+                console.print(f"  [dim]mod_load_order.txt ← {', '.join(new_dirs)}[/dim]")
+            elif new_dirs and result["drift_detected"]:
+                console.print("  [yellow]Load order: external edit detected — not modified.[/yellow]")
+            if result.get("cycles"):
+                console.print(
+                    f"  [yellow]⚠ Dependency cycle in load order: "
+                    f"{', '.join(result['cycles'])}. "
+                    f"Cycle members appended at end — break with [cyan]nexmod pin[/cyan].[/yellow]"
+                )
+        except Exception as e:
+            log.warning("reconcile after install failed: %s", e)
+            console.print(f"  [yellow]Load order reconcile failed: {e}[/yellow]")
+
     return mod["name"], mod.get("version", "?")
 
 
@@ -907,12 +1372,624 @@ def _archive_basename(filename: str) -> str:
     return filename.rsplit(".", 1)[0]
 
 
+def _normalize_name(s: str) -> str:
+    """Lowercase + strip non-alphanumerics for fuzzy folder/name comparison."""
+    return re.sub(r'[^a-z0-9]', '', (s or "").lower())
+
+
+def infer_folder_name(mod_dir: Path, row) -> tuple[str | None, list[str], str]:
+    """Best-effort guess of a tracked mod's on-disk folder.
+
+    Used by `nexmod fsck` to backfill `folder_name` for legacy rows installed
+    before the column existed. Returns (best_match, all_candidates, strategy).
+
+    Strategy ladder (first match wins):
+      1. filename_stem    — archive basename matches a folder exactly
+      2. mod_json_name    — mod.json "name"/"id" matches the Nexus mod name
+      3. dot_mod_title    — Darktide .mod file has matching name = "..."
+      4. fuzzy_match      — difflib ratio ≥ 0.85 on normalized names (unique)
+
+    Returns (None, [], "no_dir") when mod_dir is missing.
+    Returns (None, candidates, "ambiguous") when multiple equally-plausible
+    matches exist — caller must surface for manual resolution.
+    """
+    if not mod_dir or not mod_dir.exists():
+        return None, [], "no_dir"
+
+    all_dirs = sorted(p.name for p in mod_dir.iterdir() if p.is_dir())
+    if not all_dirs:
+        return None, [], "empty_dir"
+
+    # 1. Exact filename stem match
+    if row["filename"]:
+        stem = _archive_basename(row["filename"])
+        if stem in all_dirs:
+            return stem, [stem], "filename_stem"
+
+    name = row["name"] or ""
+    name_norm = _normalize_name(name)
+
+    # 2. mod.json name/id match
+    json_matches: list[str] = []
+    for d in all_dirs:
+        mj = mod_dir / d / "mod.json"
+        if not mj.exists():
+            continue
+        try:
+            data = json.loads(mj.read_text(encoding="utf-8", errors="replace"))
+            for key in ("name", "id", "Name", "Id", "modName"):
+                v = data.get(key)
+                if isinstance(v, str) and _normalize_name(v) == name_norm and name_norm:
+                    json_matches.append(d)
+                    break
+        except Exception:
+            pass
+    if len(json_matches) == 1:
+        return json_matches[0], json_matches, "mod_json_name"
+
+    # 3. Darktide .mod file: top-level name = "..."
+    dot_mod_matches: list[str] = []
+    for d in all_dirs:
+        mf = mod_dir / d / f"{d}.mod"
+        if not mf.exists():
+            continue
+        try:
+            text = mf.read_text(encoding="utf-8", errors="replace")
+            for m in re.finditer(r'name\s*=\s*"([^"]+)"', text):
+                if _normalize_name(m.group(1)) == name_norm and name_norm:
+                    dot_mod_matches.append(d)
+                    break
+        except Exception:
+            pass
+    if len(dot_mod_matches) == 1:
+        return dot_mod_matches[0], dot_mod_matches, "dot_mod_title"
+
+    # 4. Fuzzy difflib match on normalized names
+    if name_norm:
+        scored = sorted(
+            ((difflib.SequenceMatcher(None, name_norm, _normalize_name(d)).ratio(), d)
+             for d in all_dirs),
+            reverse=True,
+        )
+        top = [d for ratio, d in scored if ratio >= 0.85]
+        if len(top) == 1:
+            return top[0], top, "fuzzy_match"
+        if len(top) > 1:
+            return None, top, "ambiguous"
+
+    return None, all_dirs, "no_match"
+
+
 def _read_lof_folders(mod_dir: Path, load_order_file: str) -> list[str]:
     lof = mod_dir / load_order_file
     if not lof.exists():
         return []
     return [l.strip() for l in lof.read_text().splitlines()
             if l.strip() and not l.strip().startswith("--")]
+
+
+# ── Load Order Reconciler (v2) ───────────────────────────────────────────────
+#
+# Robust mod_load_order.txt management.
+#
+# Provenance taxonomy for each entry in the file:
+#   managed-present  : tracked in DB, folder exists on disk         → keep, topo-sort
+#   managed-missing  : tracked in DB, folder absent                 → drop
+#   orphan           : not tracked, no folder, listed in file       → drop
+#   foreign          : not tracked, folder on disk                  → preserve verbatim
+#   framework        : foreign + matches game's framework set       → pin to top
+#
+# Directives (optional, in-file, DMF-comment compatible):
+#   -- nexmod:freeze
+#   -- nexmod:framework <folder>
+#   -- nexmod:pin <folder> top
+#   -- nexmod:pin <folder> bottom
+#   -- nexmod:pin <folder> before <other>
+#   -- nexmod:pin <folder> after  <other>
+
+# Per-game framework folders that are NOT installed via Nexus and must always
+# pin to the top of the load order if present on disk. Empirically derived;
+# Darktide installs these via dtkit-patch / DMF, not via Nexus mods.
+GAME_FRAMEWORK_FOLDERS: dict[str, tuple[str, ...]] = {
+    "darktide": ("mod_compat", "dmf", "DarktideLocalServer"),
+}
+
+_DIRECTIVE_RE = re.compile(r"^\s*--\s*nexmod:(\S+)(?:\s+(.*))?$")
+BASE_HEADER = "-- File managed by nexmod"
+
+
+def _parse_directives(lines: list[str]) -> dict:
+    """Extract '-- nexmod:*' directives from raw lines."""
+    out: dict = {"frozen": False, "framework": [], "pins": []}
+    for raw in lines:
+        m = _DIRECTIVE_RE.match(raw)
+        if not m:
+            continue
+        verb = m.group(1).lower()
+        args = (m.group(2) or "").strip().split()
+        if verb == "freeze":
+            out["frozen"] = True
+        elif verb == "framework" and args:
+            out["framework"].append(args[0])
+        elif verb == "pin" and len(args) >= 2:
+            folder, pos = args[0], args[1].lower()
+            if pos in ("top", "bottom"):
+                out["pins"].append((folder, pos, None))
+            elif pos in ("before", "after") and len(args) >= 3:
+                out["pins"].append((folder, pos, args[2]))
+    return out
+
+
+def _parse_load_order_file(text: str) -> dict:
+    """Parse a load-order file into structured pieces preserving comments.
+
+    The canonical BASE_HEADER ('-- File managed by nexmod') is recognised and
+    stripped on parse; it is re-emitted exactly once on render.
+
+    Anchored comments: a run of '--' comment lines immediately above an entry
+    is attached to that entry and follows it through reordering.
+    Header comments: comments before any entry (after directives).
+    Tail comments:   comments after the last entry.
+    """
+    lines = text.splitlines()
+    directives = _parse_directives(lines)
+    directive_lines = [l for l in lines if _DIRECTIVE_RE.match(l)]
+
+    entries: list[str] = []
+    anchored: dict[str, list[str]] = {}
+    header_comments: list[str] = []
+    tail_comments: list[str] = []
+    pending: list[str] = []
+    seen_entry = False
+
+    for raw in lines:
+        if _DIRECTIVE_RE.match(raw):
+            continue
+        stripped = raw.strip()
+        # Drop the canonical managed-by header — render emits it deterministically.
+        if stripped == BASE_HEADER:
+            continue
+        if not stripped:
+            if pending:
+                (header_comments if not seen_entry else tail_comments).extend(pending)
+                pending = []
+            continue
+        if stripped.startswith("--"):
+            pending.append(raw)
+            continue
+        if pending:
+            anchored[stripped] = pending
+            pending = []
+        entries.append(stripped)
+        seen_entry = True
+
+    if pending:
+        (header_comments if not seen_entry else tail_comments).extend(pending)
+
+    return {
+        "directives":        directives,
+        "directive_lines":   directive_lines,
+        "header_comments":   header_comments,
+        "entries":           entries,
+        "anchored_comments": anchored,
+        "tail_comments":     tail_comments,
+    }
+
+
+def _classify_entries(
+    entries: list[str],
+    *,
+    db_folders: set[str],
+    disk_folders: set[str],
+    framework_folders: set[str],
+) -> dict[str, str]:
+    """Classify each listed folder: managed-present | managed-missing | orphan | foreign | framework."""
+    out: dict[str, str] = {}
+    for f in entries:
+        in_db, on_disk = (f in db_folders), (f in disk_folders)
+        if in_db and on_disk:
+            out[f] = "managed-present"
+        elif in_db and not on_disk:
+            out[f] = "managed-missing"
+        elif on_disk and f in framework_folders:
+            out[f] = "framework"
+        elif on_disk:
+            out[f] = "foreign"
+        else:
+            out[f] = "orphan"
+    return out
+
+
+def _db_tracked_folders(
+    db: sqlite3.Connection, game: str, *, disk_folders: set[str] | None = None,
+) -> dict[str, int]:
+    """Return {folder_name: mod_id} for tracked mods.
+
+    Prefers the explicit ``folder_name`` column (captured at install time).
+    Falls back to ``_archive_basename(filename)`` only when that name is also
+    a real on-disk folder — this avoids classifying never-existed stems as
+    DB-managed for legacy rows that never recorded folder_name.
+    """
+    out: dict[str, int] = {}
+    rows = db.execute(
+        "SELECT mod_id, filename, folder_name FROM mods WHERE game=?",
+        (game,),
+    ).fetchall()
+    for row in rows:
+        folder = row["folder_name"]
+        if not folder and row["filename"]:
+            stem = _archive_basename(row["filename"])
+            if disk_folders is not None and stem in disk_folders:
+                folder = stem
+        if folder:
+            out[folder] = row["mod_id"]
+    return out
+
+
+def _disk_folders(mod_dir: Path) -> set[str]:
+    if not mod_dir.exists():
+        return set()
+    return {p.name for p in mod_dir.iterdir() if p.is_dir()}
+
+
+def _load_db_pins(db: sqlite3.Connection, game: str) -> list[tuple[str, str, str | None]]:
+    rows = db.execute(
+        "SELECT folder, position, relative_to FROM load_order_pins WHERE game=? "
+        "ORDER BY created_at",
+        (game,),
+    ).fetchall()
+    return [(r["folder"], r["position"], r["relative_to"]) for r in rows]
+
+
+def _apply_pins(
+    *,
+    sorted_managed: list[str],
+    foreign: list[str],
+    framework: list[str],
+    pins: list[tuple[str, str, str | None]],
+) -> list[str]:
+    """Compose final order: framework → pin(top) → middle (managed+foreign, before/after pins applied) → pin(bottom)."""
+    head: list[str] = []
+    seen: set[str] = set()
+    for f in framework:
+        if f not in seen:
+            head.append(f); seen.add(f)
+    for folder, pos, _ in [p for p in pins if p[1] == "top"]:
+        if folder not in seen:
+            head.append(folder); seen.add(folder)
+
+    middle = [m for m in sorted_managed if m not in seen]
+    for f in foreign:
+        if f not in seen and f not in middle:
+            middle.append(f)
+
+    for folder, pos, rel in [p for p in pins if p[1] in ("before", "after")]:
+        if folder in middle and rel in middle:
+            middle.remove(folder)
+            idx = middle.index(rel) + (1 if pos == "after" else 0)
+            middle.insert(idx, folder)
+
+    seen.update(middle)
+    tail: list[str] = []
+    for folder, pos, _ in [p for p in pins if p[1] == "bottom"]:
+        if folder not in seen:
+            tail.append(folder); seen.add(folder)
+
+    return head + middle + tail
+
+
+def _render_load_order(
+    *,
+    directive_lines: list[str],
+    header_comments: list[str],
+    ordered: list[str],
+    anchored_comments: dict[str, list[str]],
+    tail_comments: list[str],
+) -> str:
+    """Render the final file contents, preserving directives + comments."""
+    out: list[str] = []
+    has_base = any(BASE_HEADER in l for l in header_comments)
+    if not has_base:
+        out.append(BASE_HEADER)
+    out.extend(directive_lines)
+    out.extend(header_comments)
+    for folder in ordered:
+        out.extend(anchored_comments.get(folder, []))
+        out.append(folder)
+    out.extend(tail_comments)
+    return "\n".join(out) + "\n"
+
+
+def _atomic_write_with_backup(target: Path, contents: str) -> None:
+    """Write CONTENTS to TARGET via tempfile + os.replace + fsync. Keeps a .bak of the previous file."""
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if target.exists():
+        bak = target.with_suffix(target.suffix + ".bak")
+        try:
+            shutil.copy2(target, bak)
+        except Exception as e:
+            log.warning("could not write backup %s: %s", bak, e)
+    fd, tmp_path = tempfile.mkstemp(prefix=".nexmod-tmp-", dir=str(target.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(contents)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, target)
+        try:
+            dir_fd = os.open(str(target.parent), os.O_RDONLY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+        except OSError:
+            pass  # some filesystems don't support directory fsync
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
+def _flock_path(target: Path) -> Path:
+    return target.with_suffix(target.suffix + ".lock")
+
+
+def _hash_text(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest() if text else ""
+
+
+def reconcile_load_order(
+    game: str,
+    db: sqlite3.Connection,
+    mod_dir: Path,
+    *,
+    dry_run: bool = False,
+    auto_merge: bool = False,
+    profile_set: list[str] | None = None,
+    strict_profile: bool = False,
+) -> dict:
+    """Reconcile mod_load_order.txt against DB + disk + pins + directives.
+
+    Single entrypoint for every state-mutating command.
+
+    Args:
+        profile_set:    if not None, treat this list as the desired managed-mod set
+                        (used by 'profile load'). Foreign entries are kept by default.
+        strict_profile: with profile_set, also wipe foreign entries.
+        auto_merge:     proceed even if external drift is detected.
+        dry_run:        compute and return diff, do not write.
+
+    Returns dict with keys: changed, written, drift_detected, classification,
+    diff, orphans_dropped, missing_added, foreign_kept, cycles, missing_deps, frozen.
+    """
+    info = GAMES.get(game) or {}
+    lof_filename = info.get("load_order_file")
+    if not lof_filename:
+        return _empty_reconcile_result()
+
+    lof = mod_dir / lof_filename
+    lock_path = _flock_path(lof)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o644)
+
+    try:
+        for attempt in range(4):
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if attempt == 3:
+                    raise RuntimeError(
+                        f"Could not acquire lock on {lock_path}; another nexmod process running?"
+                    )
+                time.sleep(0.2)
+
+        original_text = lof.read_text() if lof.exists() else ""
+        h_now = _hash_text(original_text)
+
+        h_db_row = db.execute(
+            "SELECT last_hash FROM load_order_state WHERE game=?", (game,)
+        ).fetchone()
+        h_db = h_db_row["last_hash"] if h_db_row else None
+        drift_detected = bool(h_db and h_now and h_now != h_db)
+
+        parsed = _parse_load_order_file(original_text)
+        directives        = parsed["directives"]
+        entries_in        = parsed["entries"]
+        anchored_comments = parsed["anchored_comments"]
+        header_comments   = parsed["header_comments"]
+        tail_comments     = parsed["tail_comments"]
+        directive_lines   = parsed["directive_lines"]
+
+        frozen = directives["frozen"]
+
+        disk            = _disk_folders(mod_dir)
+        db_folder_to_id = _db_tracked_folders(db, game, disk_folders=disk)
+        db_folders      = set(db_folder_to_id.keys())
+        framework_set   = set(GAME_FRAMEWORK_FOLDERS.get(game, ())) | set(directives["framework"])
+
+        pins = list(directives["pins"]) + _load_db_pins(db, game)
+
+        classification = _classify_entries(
+            entries_in,
+            db_folders=db_folders,
+            disk_folders=disk,
+            framework_folders=framework_set,
+        )
+
+        orphans_dropped = [f for f, c in classification.items()
+                           if c in ("orphan", "managed-missing")]
+
+        listed = set(entries_in)
+        missing_added: list[str] = sorted(f for f in db_folders
+                                          if f in disk and f not in listed)
+        for fw in framework_set:
+            if fw in disk and fw not in listed and fw not in missing_added:
+                missing_added.append(fw)
+
+        if frozen:
+            return {
+                "changed": False, "written": False, "drift_detected": drift_detected,
+                "classification": classification, "diff": "",
+                "orphans_dropped": orphans_dropped, "missing_added": missing_added,
+                "foreign_kept": [f for f, c in classification.items() if c == "foreign"],
+                "cycles": [], "missing_deps": {}, "frozen": True,
+            }
+
+        dropped_by_profile: list[str] = []
+        cycles: list[str] = []
+        missing_deps: dict[str, list[str]] = {}
+
+        if profile_set is not None:
+            # Profile mode: the profile's order is canonical — no topo reorder.
+            # Render: framework_list + (profile order minus framework) + foreign_tail
+            foreign_keep: set[str] = set()
+            if not strict_profile:
+                foreign_keep = {f for f, c in classification.items() if c == "foreign"}
+
+            kept_in_file = [f for f in entries_in
+                            if f in framework_set or f in set(profile_set) or f in foreign_keep]
+            dropped_by_profile = [f for f in entries_in if f not in kept_in_file]
+
+            framework_list = [f for f in kept_in_file if f in framework_set]
+            for fw in framework_set:
+                if fw in disk and fw not in framework_list:
+                    framework_list.append(fw)
+
+            profile_body = [f for f in profile_set if f not in framework_set]
+
+            foreign_tail = [f for f in kept_in_file
+                            if f not in framework_set and f not in set(profile_body)]
+
+            ordered = framework_list + profile_body + foreign_tail
+            foreign_list = foreign_tail
+
+            # Diagnostics only — does not affect ordering.
+            managed_subset_for_deps = [f for f in ordered if f in db_folders and f in disk]
+            for folder in managed_subset_for_deps:
+                raw = _parse_mod_deps(mod_dir, folder)
+                missing = [d for d in raw if d not in set(managed_subset_for_deps)]
+                if missing:
+                    missing_deps[folder] = missing
+        else:
+            entries_after_profile = list(entries_in)
+
+            # Working set: drop orphans/missing, then add discovered managed/framework
+            working = [f for f in entries_after_profile
+                       if classification.get(f) not in ("orphan", "managed-missing")]
+            for f in missing_added:
+                if f not in working:
+                    working.append(f)
+
+            # Topo-sort the managed-present subset; foreign + framework keep relative order
+            managed_subset = [f for f in working if f in db_folders and f in disk]
+            managed_set    = set(managed_subset)
+            deps_map: dict[str, list[str]] = {}
+            for folder in managed_subset:
+                raw = _parse_mod_deps(mod_dir, folder)
+                known   = [d for d in raw if d in managed_set]
+                missing = [d for d in raw if d not in managed_set]
+                deps_map[folder] = known
+                if missing:
+                    missing_deps[folder] = missing
+            sorted_managed, cycles = _topo_sort(managed_subset, deps_map)
+
+            foreign_list   = [f for f in working
+                              if f not in db_folders and f in disk and f not in framework_set]
+            framework_list = [f for f in working if f in framework_set]
+            for fw in framework_set:
+                if fw in disk and fw not in framework_list:
+                    framework_list.append(fw)
+
+            ordered = _apply_pins(
+                sorted_managed=sorted_managed + cycles,
+                foreign=foreign_list,
+                framework=framework_list,
+                pins=pins,
+            )
+
+        new_text = _render_load_order(
+            directive_lines=directive_lines,
+            header_comments=header_comments,
+            ordered=ordered,
+            anchored_comments=anchored_comments,
+            tail_comments=tail_comments,
+        )
+
+        changed = (new_text != original_text)
+        diff_text = ""
+        if dry_run and changed:
+            diff_text = "".join(difflib.unified_diff(
+                original_text.splitlines(keepends=True),
+                new_text.splitlines(keepends=True),
+                fromfile=f"{lof} (current)",
+                tofile=f"{lof} (proposed)",
+                n=3,
+            ))
+
+        if drift_detected and changed and not auto_merge and not dry_run:
+            log.warning(
+                "Drift detected on %s: file changed externally since last write. "
+                "Refusing to overwrite. Pass --auto-merge to proceed.", lof,
+            )
+            return {
+                "changed": False, "written": False, "drift_detected": True,
+                "classification": classification, "diff": "",
+                "orphans_dropped": orphans_dropped + dropped_by_profile,
+                "missing_added": missing_added,
+                "foreign_kept": foreign_list, "cycles": cycles,
+                "missing_deps": missing_deps, "frozen": False,
+            }
+
+        written = False
+        if changed and not dry_run:
+            _atomic_write_with_backup(lof, new_text)
+            new_hash = _hash_text(new_text)
+            db.execute("""
+                INSERT INTO load_order_state (game, file_path, last_hash, last_written_at, frozen)
+                VALUES (?, ?, ?, ?, 0)
+                ON CONFLICT(game) DO UPDATE SET
+                    file_path       = excluded.file_path,
+                    last_hash       = excluded.last_hash,
+                    last_written_at = excluded.last_written_at
+            """, (game, str(lof), new_hash, now_iso()))
+            db.commit()
+            written = True
+        elif not changed and h_db is None and h_now:
+            # First-run adoption: persist current hash for future drift detection.
+            db.execute("""
+                INSERT INTO load_order_state (game, file_path, last_hash, last_written_at, frozen)
+                VALUES (?, ?, ?, ?, 0)
+                ON CONFLICT(game) DO UPDATE SET
+                    file_path       = excluded.file_path,
+                    last_hash       = excluded.last_hash,
+                    last_written_at = excluded.last_written_at
+            """, (game, str(lof), h_now, now_iso()))
+            db.commit()
+
+        return {
+            "changed": changed, "written": written, "drift_detected": drift_detected,
+            "classification": classification, "diff": diff_text,
+            "orphans_dropped": orphans_dropped + dropped_by_profile,
+            "missing_added": missing_added, "foreign_kept": foreign_list,
+            "cycles": cycles, "missing_deps": missing_deps, "frozen": False,
+        }
+    finally:
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        finally:
+            os.close(lock_fd)
+
+
+def _empty_reconcile_result() -> dict:
+    return {
+        "changed": False, "written": False, "drift_detected": False,
+        "classification": {}, "diff": "", "orphans_dropped": [],
+        "missing_added": [], "foreign_kept": [], "cycles": [],
+        "missing_deps": {}, "frozen": False,
+    }
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
@@ -1098,16 +2175,21 @@ def profile_show(game, name):
 @click.option("--dry-run", is_flag=True, help="Show what would change without writing anything")
 @click.option("--install", "do_install_missing", is_flag=True,
               help="Install profile mods not on disk (uses tracked mod_id from the DB).")
-def profile_load(game, name, dry_run, do_install_missing):
-    """Apply a profile — rewrites the load order file with the profile's mod list.
+@click.option("--strict", is_flag=True,
+              help="Also drop foreign entries (untracked folders the user/game added). "
+                   "Default preserves them.")
+def profile_load(game, name, dry_run, do_install_missing, strict):
+    """Apply a profile — sets the managed load order to the profile's mod list.
 
-    Mods not in the profile stay on disk but won't be loaded by the game.
+    Mods in the profile are pinned to load. Foreign entries (folders not
+    tracked by nexmod) are preserved by default; pass --strict to drop them.
 
     \b
     Examples:
       nexmod profile load darktide minimal
       nexmod profile load darktide full --dry-run
       nexmod profile load darktide full --install
+      nexmod profile load darktide minimal --strict
     """
     if dry_run and do_install_missing:
         console.print("[red]--dry-run and --install are mutually exclusive.[/red]")
@@ -1184,13 +2266,34 @@ def profile_load(game, name, dry_run, do_install_missing):
             )
         console.print(f"[green]Installed {installed}/{len(missing_on_disk)} missing profile mod(s).[/green]")
 
+    result = reconcile_load_order(
+        game, db, mod_dir,
+        dry_run=dry_run,
+        profile_set=profile_order,
+        strict_profile=strict,
+    )
+
+    if result["drift_detected"] and not result["written"]:
+        console.print("[yellow]External edit to load order detected — refusing to overwrite. "
+                      "Re-run after reviewing 'nexmod order " + game + " --check', "
+                      "or pass --auto-merge (future).[/yellow]")
+        return
+
     if dry_run:
+        if result["diff"]:
+            console.print(Syntax(result["diff"], "diff", theme="ansi_dark"))
         console.print("\n[dim]Dry run — no changes made.[/dim]")
         return
 
-    _apply_profile(mod_dir, lof_file, profile_order)
     log.info("Profile '%s' applied for %s (%d mods)", name, game, len(profile_order))
-    console.print(f"\n[green]✓ Profile '{name}' applied.[/green]")
+    if result["written"]:
+        console.print(f"\n[green]✓ Profile '{name}' applied.[/green]")
+        if result["foreign_kept"] and not strict:
+            console.print(f"[dim]  ({len(result['foreign_kept'])} foreign "
+                          f"entr{'y' if len(result['foreign_kept']) == 1 else 'ies'} "
+                          f"preserved — pass --strict to drop them.)[/dim]")
+    else:
+        console.print(f"[dim]Load order already matches profile '{name}'.[/dim]")
 
 
 @profile.command("delete")
@@ -1441,6 +2544,136 @@ def games_list():
     console.print(t)
 
 
+# doctor ──────────────────────────────────────────────────────────────────────
+
+@cli.command("doctor")
+@click.option("--game", help="Limit game-install checks to this slug.")
+def doctor(game):
+    """Pre-flight environment check.
+
+    Verifies the things that cause cryptic errors later: API key + Premium
+    status, Steam library detection, per-game install paths, Wine + 7z
+    binaries, disk space, and config/data directory writability.
+
+    Exit code 0 when everything is OK, 1 when at least one check fails.
+    """
+    ok = True
+    warnings = 0
+
+    def status(label: str, passed: bool, detail: str = "", warn: bool = False) -> None:
+        nonlocal ok, warnings
+        if passed:
+            mark = "[green]✓[/green]"
+        elif warn:
+            mark = "[yellow]![/yellow]"
+            warnings += 1
+        else:
+            mark = "[red]✗[/red]"
+            ok = False
+        msg = f"  {mark} {label}"
+        if detail:
+            msg += f" — [dim]{detail}[/dim]"
+        console.print(msg)
+
+    console.print("[bold]nexmod doctor[/bold] — environment pre-flight\n")
+
+    # ── Config + data directories ────────────────────────────────────────────
+    console.print("[bold]Filesystem[/bold]")
+    cfg_writable = os.access(CONFIG_DIR.parent, os.W_OK)
+    status(f"Config dir writable ({CONFIG_DIR})", cfg_writable)
+    data_writable = os.access(DATA_DIR.parent, os.W_OK)
+    status(f"Data dir writable ({DATA_DIR})", data_writable)
+    try:
+        usage = shutil.disk_usage(DATA_DIR if DATA_DIR.exists() else DATA_DIR.parent)
+        free_gb = usage.free / (1024 ** 3)
+        status(f"Disk space at data dir", free_gb >= 1.0,
+               f"{free_gb:.1f} GB free", warn=(0.1 < free_gb < 1.0))
+    except OSError as e:
+        status("Disk space at data dir", False, str(e))
+
+    # ── API key + Premium ────────────────────────────────────────────────────
+    console.print("\n[bold]Nexus API[/bold]")
+    cfg = load_config()
+    has_key = bool(cfg.get("api_key"))
+    status("API key configured", has_key,
+           "" if has_key else "run: nexmod config set-key <key>")
+    if has_key:
+        try:
+            user = nexus_get("users/validate.json", cfg["api_key"])
+            name = user.get("name") or user.get("username") or "?"
+            status(f"API key valid", True, f"user: {name}")
+            premium = user.get("is_premium") or user.get("isPremium")
+            status("Premium account", bool(premium),
+                   "" if premium else "Premium required for downloads")
+        except SystemExit:
+            status("API key valid", False, "validate.json failed")
+        except Exception as e:
+            status("API key valid", False, str(e))
+
+    # ── External binaries ────────────────────────────────────────────────────
+    console.print("\n[bold]External tools[/bold]")
+    has_wine = bool(shutil.which("wine"))
+    status("wine (for Darktide enable/disable)", has_wine,
+           "" if has_wine else "needed only for dtkit-patch", warn=not has_wine)
+    has_7z = bool(shutil.which("7z") or shutil.which("7zz") or shutil.which("7za"))
+    status("7z (for .7z archives)", has_7z,
+           "" if has_7z else "install p7zip-full", warn=not has_7z)
+
+    # ── Steam libraries ──────────────────────────────────────────────────────
+    console.print("\n[bold]Steam[/bold]")
+    libs = find_steam_library_paths()
+    status(f"Steam library detected", bool(libs),
+           f"{len(libs)} library path(s)" if libs else "no libraries found")
+    for lib in libs:
+        console.print(f"    [dim]{lib}[/dim]")
+
+    # ── Per-game installs ────────────────────────────────────────────────────
+    console.print("\n[bold]Game installs[/bold]")
+    targets = [game] if game else list(GAMES.keys())
+    for slug in targets:
+        info = GAMES.get(slug)
+        if not info:
+            status(slug, False, "unknown game slug")
+            continue
+        path = find_game_install(info["steam_id"])
+        if path:
+            mod_subdir = path / info["mod_subdir"]
+            status(f"{slug}: install found", True, str(path))
+            status(f"{slug}: mod dir exists", mod_subdir.exists(),
+                   str(mod_subdir),
+                   warn=not mod_subdir.exists())
+        else:
+            status(f"{slug}: install found", False,
+                   "not installed via Steam (or different library)", warn=True)
+
+    # ── DB integrity ─────────────────────────────────────────────────────────
+    console.print("\n[bold]Database[/bold]")
+    try:
+        db = get_db()
+        n_mods = db.execute("SELECT COUNT(*) FROM mods").fetchone()[0]
+        n_null = db.execute(
+            "SELECT COUNT(*) FROM mods WHERE folder_name IS NULL"
+        ).fetchone()[0]
+        status("DB readable", True, f"{n_mods} tracked mods")
+        status("All folder_name backfilled", n_null == 0,
+               f"{n_null} legacy rows — run: nexmod fsck --fix" if n_null else "",
+               warn=(n_null > 0))
+    except Exception as e:
+        status("DB readable", False, str(e))
+
+    console.print()
+    if ok:
+        if warnings:
+            console.print(f"[green]All required checks passed[/green] "
+                          f"[yellow]({warnings} warning{'s' if warnings != 1 else ''})[/yellow]")
+        else:
+            console.print("[green]All checks passed.[/green]")
+        sys.exit(0)
+    else:
+        console.print("[red]One or more checks failed. Address above before running install/update.[/red]")
+        sys.exit(1)
+
+
 # scan ────────────────────────────────────────────────────────────────────────
 
 @cli.command("scan")
@@ -1485,14 +2718,15 @@ def scan_vortex(game, dry_run):
             # With version=None, 'update' will download and install the current version.
             db.execute("""
                 INSERT OR IGNORE INTO mods
-                    (game, mod_id, file_id, name, version, filename, mod_dir, tracked_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    (game, mod_id, file_id, name, version, filename, mod_dir,
+                     folder_name, tracked_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 game, mod_id,
                 chosen["file_id"] if chosen else 0,
                 mod["name"], None,
                 chosen["file_name"] if chosen else None,
-                str(mod_dir), now_iso(),
+                str(mod_dir), (folder or None), now_iso(),
             ))
             db.commit()
             record(db, "scan", game, mod_id, mod["name"], None, "ok",
@@ -1506,6 +2740,23 @@ def scan_vortex(game, dry_run):
 
     console.print(f"\n[bold]Done.[/bold] {ok} tracked, {fail} failed.")
 
+    # Reconcile load order: discovered Vortex folders are now both in DB
+    # (we just inserted) and on disk (Vortex left them) — reconciler will
+    # add any that aren't yet listed.
+    info_cur = GAMES.get(game) or {}
+    if info_cur.get("load_order_file") and ok > 0:
+        try:
+            result = reconcile_load_order(game, db, mod_dir)
+            if result["written"]:
+                added = result["missing_added"]
+                if added:
+                    console.print(f"[dim]Load order ← {len(added)} new entr"
+                                  f"{'y' if len(added) == 1 else 'ies'}.[/dim]")
+            elif result["drift_detected"]:
+                console.print("[yellow]Load order: external edit detected — not modified.[/yellow]")
+        except Exception as e:
+            log.warning("reconcile after scan failed: %s", e)
+
 
 # install ─────────────────────────────────────────────────────────────────────
 
@@ -1514,7 +2765,9 @@ def scan_vortex(game, dry_run):
 @click.argument("mod_id", type=int, required=False, default=None)
 @click.option("--file-id", type=int, default=None, help="Force a specific file ID")
 @click.option("--no-reorder", is_flag=True, help="Skip automatic load order sort after install")
-def install(game, mod_id, file_id, no_reorder):
+@click.option("--dry-run", is_flag=True,
+              help="Resolve mod metadata + show what would be downloaded; do not fetch or extract.")
+def install(game, mod_id, file_id, no_reorder, dry_run):
     """Download and install a mod. Starts tracking it for updates.
 
     \b
@@ -1537,24 +2790,51 @@ def install(game, mod_id, file_id, no_reorder):
 
     api_key = get_api_key()
     db = get_db()
+
+    if dry_run:
+        info_g = GAMES.get(game, {})
+        domain = info_g.get("domain", game)
+        mod = api_mod_info(domain, mod_id, api_key)
+        files = api_mod_files(domain, mod_id, api_key)
+        chosen = next((f for f in files if f["file_id"] == file_id), None) if file_id else pick_main_file(files)
+        if not chosen:
+            console.print("[red](dry-run) Could not determine main file.[/red]")
+            sys.exit(1)
+        target_dir = resolve_mod_dir(game, db)
+        console.print(f"\n[bold](dry-run) would install:[/bold]")
+        console.print(f"  Mod:        [cyan]{mod['name']}[/cyan] v{mod.get('version', '?')}")
+        console.print(f"  File:       {chosen['file_name']} ({chosen.get('size_kb', '?')} KB, "
+                      f"category={chosen.get('category_name')})")
+        console.print(f"  Target dir: {target_dir}")
+        # Wine warning for Darktide installs (needed for enable/disable later)
+        if game == "darktide" and not shutil.which("wine"):
+            console.print("  [yellow]⚠ wine not found — install it now to use enable/disable later.[/yellow]")
+        return
+
+    # Wine pre-check for Darktide installs (warn only, install proceeds)
+    if game == "darktide" and not shutil.which("wine"):
+        console.print(
+            "[yellow]⚠ wine is not installed.[/yellow] Mods will install fine, but "
+            "you'll need wine to run [cyan]nexmod enable darktide[/cyan]."
+        )
+
     name, version = do_install(game, mod_id, file_id, api_key, db)
     console.print(f"\n[green]✓ Installed:[/green] {name} v{version}")
 
     info = GAMES.get(game)
     if info and info.get("load_order_file") and not no_reorder and get_auto_reorder():
         mod_dir = resolve_mod_dir(game, db)
-        lof     = info["load_order_file"]
-        result  = reorder_load_order(mod_dir, lof)
-        if result["changed"]:
-            console.print(f"  [dim]Load order sorted ({len(result['order'])} mods)[/dim]")
+        # do_install already reconciled. Re-run to surface missing deps from the
+        # post-install state and to handle any that need user prompting.
+        result = reconcile_load_order(game, db, mod_dir, dry_run=True)
         if result["cycles"]:
             console.print(f"  [yellow]Dependency cycle detected: {', '.join(result['cycles'])}[/yellow]")
         if result["missing_deps"]:
             newly = _handle_missing_deps(game, result["missing_deps"], mod_dir, api_key, db)
             if newly:
-                result2 = reorder_load_order(mod_dir, lof)
-                if result2["changed"]:
-                    console.print(f"  [dim]Load order re-sorted after dependency install[/dim]")
+                # Fresh reconcile after dep installs (do_install already ran reconcile
+                # for each dep, but a final pass ensures topo order is canonical).
+                reconcile_load_order(game, db, mod_dir)
 
 
 # track ───────────────────────────────────────────────────────────────────────
@@ -1747,17 +3027,28 @@ def check_updates(game):
 @cli.command("order")
 @click.argument("game")
 @click.option("--dry-run", is_flag=True, help="Preview new order without writing to disk.")
-def order_mods(game, dry_run):
-    """Show and (re)sort the load order file by mod dependency declarations.
+@click.option("--check", is_flag=True, help="Print classification table + diff, do not write.")
+@click.option("--fsck", is_flag=True, help="Restore mod_load_order.txt from .bak if present.")
+@click.option("--freeze", is_flag=True, help="Add the freeze directive (nexmod will refuse to modify the file).")
+@click.option("--unfreeze", is_flag=True, help="Remove the freeze directive.")
+@click.option("--adopt", is_flag=True, help="Promote foreign entries: prompt for mod_id per untracked folder.")
+@click.option("--auto-merge", is_flag=True, help="Proceed even if external edit drift is detected.")
+def order_mods(game, dry_run, check, fsck, freeze, unfreeze, adopt, auto_merge):
+    """Show, sort, and manage the load order file.
 
-    Reads each mod's mod.json, builds a dependency graph, and sorts using a
-    topological sort (Kahn's algorithm). Mods without mod.json keep their
-    relative position. Dependency cycles are detected and placed at the end.
+    Reconciles mod_load_order.txt against the DB, on-disk folders, pins, and
+    in-file directives. Drops orphaned entries, adds discovered framework
+    folders, preserves foreign (untracked) entries, topo-sorts the rest by
+    declared dependencies. Atomic write with .bak retained.
 
     \b
     Examples:
-      nexmod order darktide              # sort and write
-      nexmod order darktide --dry-run    # preview only
+      nexmod order darktide              # reconcile and write
+      nexmod order darktide --dry-run    # preview the proposed order
+      nexmod order darktide --check      # detailed classification + diff
+      nexmod order darktide --freeze     # disable nexmod auto-mutation
+      nexmod order darktide --adopt      # promote foreign entries to tracked
+      nexmod order darktide --fsck       # restore from .bak
     """
     info = GAMES.get(game)
     if not info or not info.get("load_order_file"):
@@ -1766,47 +3057,267 @@ def order_mods(game, dry_run):
 
     db      = get_db()
     mod_dir = resolve_mod_dir(game, db)
-    lof     = info["load_order_file"]
+    lof_filename = info["load_order_file"]
+    lof     = mod_dir / lof_filename
 
-    if not (mod_dir / lof).exists():
-        console.print(f"[yellow]No {lof} found in {mod_dir}[/yellow]")
+    # ── --fsck: restore from .bak ────────────────────────────────────────────
+    if fsck:
+        bak = lof.with_suffix(lof.suffix + ".bak")
+        if not bak.exists():
+            console.print(f"[red]No backup at {bak}.[/red]")
+            sys.exit(1)
+        if lof.exists() and not click.confirm(
+            f"Restore {lof.name} from {bak.name}? Current file will be overwritten.",
+            default=False,
+        ):
+            console.print("[dim]Aborted.[/dim]")
+            return
+        _atomic_write_with_backup(lof, bak.read_text())
+        # Reset hash so reconciler sees the restored state as canonical.
+        new_hash = _hash_text(bak.read_text())
+        db.execute("""
+            INSERT INTO load_order_state (game, file_path, last_hash, last_written_at, frozen)
+            VALUES (?, ?, ?, ?, 0)
+            ON CONFLICT(game) DO UPDATE SET
+                last_hash = excluded.last_hash,
+                last_written_at = excluded.last_written_at
+        """, (game, str(lof), new_hash, now_iso()))
+        db.commit()
+        console.print(f"[green]✓ Restored {lof.name} from backup.[/green]")
         return
 
-    result  = reorder_load_order(mod_dir, lof, dry_run=dry_run)
-    order   = result["order"]
-    cycles  = set(result["cycles"])
-    dm      = result["deps_map"]
+    # ── --freeze / --unfreeze: directive toggle ──────────────────────────────
+    if freeze or unfreeze:
+        if freeze and unfreeze:
+            console.print("[red]--freeze and --unfreeze are mutually exclusive.[/red]")
+            sys.exit(1)
+        if not lof.exists():
+            console.print(f"[yellow]No {lof_filename} found in {mod_dir}[/yellow]")
+            return
+        text  = lof.read_text()
+        lines = text.splitlines()
+        directive = "-- nexmod:freeze"
+        already   = any(_DIRECTIVE_RE.match(l) and l.strip().lower() == directive.lower()
+                        for l in lines)
+        if freeze and already:
+            console.print("[dim]Already frozen.[/dim]")
+            return
+        if unfreeze and not already:
+            console.print("[dim]Not frozen.[/dim]")
+            return
+        if freeze:
+            new_lines = [BASE_HEADER, directive] + [l for l in lines if l.strip() != BASE_HEADER]
+            new_text  = "\n".join(new_lines) + "\n"
+        else:
+            new_lines = [
+                l for l in lines
+                if not (_DIRECTIVE_RE.match(l) and l.strip().lower() == directive.lower())
+            ]
+            new_text  = "\n".join(new_lines) + ("\n" if new_lines and not new_lines[-1].endswith("\n") else "")
+        _atomic_write_with_backup(lof, new_text)
+        new_hash = _hash_text(new_text)
+        db.execute("""
+            INSERT INTO load_order_state (game, file_path, last_hash, last_written_at, frozen)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(game) DO UPDATE SET
+                last_hash = excluded.last_hash,
+                last_written_at = excluded.last_written_at,
+                frozen = excluded.frozen
+        """, (game, str(lof), new_hash, now_iso(), 1 if freeze else 0))
+        db.commit()
+        console.print(f"[green]✓ Load order {'frozen' if freeze else 'unfrozen'}.[/green]")
+        return
 
-    title = f"Load order — {game}" + (" (dry run, not saved)" if dry_run else "")
-    t = Table(title=title, show_lines=False, box=None, padding=(0, 1))
-    t.add_column("#",       style="dim",   width=4, justify="right")
-    t.add_column("Folder",  style="bold",  min_width=20)
-    t.add_column("Depends on",             style="dim")
-    t.add_column("",        width=8)
+    # ── --adopt: promote foreign entries to tracked ─────────────────────────
+    if adopt:
+        if not lof.exists():
+            console.print(f"[yellow]No {lof_filename} found in {mod_dir}[/yellow]")
+            return
+        api_key = get_api_key()
+        result  = reconcile_load_order(game, db, mod_dir, dry_run=True)
+        foreign = [f for f, c in result["classification"].items() if c == "foreign"]
+        if not foreign:
+            console.print("[dim]No foreign entries to adopt.[/dim]")
+            return
+        console.print(f"Found [yellow]{len(foreign)}[/yellow] foreign entry(ies). "
+                      "Paste a Nexus URL for each (Enter to skip).")
+        adopted = 0
+        for folder in foreign:
+            url = click.prompt(f"  {folder}", default="", show_default=False).strip()
+            if not url:
+                continue
+            try:
+                a_game, a_mod_id, a_file_id = parse_nexus_url(url)
+                if a_game != game:
+                    console.print(f"  [yellow]URL is for '{a_game}' — using '{game}' instead.[/yellow]")
+                do_install(game, a_mod_id, a_file_id, api_key, db)
+                adopted += 1
+            except Exception as e:
+                console.print(f"  [red]Adopt failed: {e}[/red]")
+        console.print(f"[green]Adopted {adopted}/{len(foreign)} entry(ies).[/green]")
+        return
 
-    for i, folder in enumerate(order, 1):
-        deps_str  = ", ".join(dm.get(folder, [])) or "—"
-        flag      = "[red]CYCLE[/red]" if folder in cycles else ""
-        t.add_row(str(i), folder, deps_str, flag)
+    # ── default / --check / --dry-run: reconcile flow ───────────────────────
+    if not lof.exists():
+        console.print(f"[yellow]No {lof_filename} found in {mod_dir}[/yellow]")
+        return
 
+    do_dry = dry_run or check
+    result = reconcile_load_order(game, db, mod_dir, dry_run=do_dry, auto_merge=auto_merge)
+
+    if result["frozen"]:
+        console.print(f"[yellow]Load order is frozen ('-- nexmod:freeze' directive).[/yellow] "
+                      f"No changes made. Run with --unfreeze to lift.")
+        if check:
+            _print_classification(result["classification"])
+        return
+
+    if result["drift_detected"] and not result["written"]:
+        console.print("[yellow]External edit to load order detected since nexmod last wrote it.[/yellow]")
+        if check or do_dry:
+            console.print(f"[dim]Run with --auto-merge to apply nexmod's plan over the edit.[/dim]")
+        else:
+            console.print(f"[red]Refusing to overwrite. Pass --auto-merge to proceed.[/red]")
+            return
+
+    if check:
+        _print_classification(result["classification"])
+        if result["missing_added"]:
+            console.print(f"\n[bold]Would add ({len(result['missing_added'])}):[/bold] "
+                          + ", ".join(result["missing_added"]))
+        if result["orphans_dropped"]:
+            console.print(f"\n[bold]Would drop ({len(result['orphans_dropped'])}):[/bold] "
+                          + ", ".join(result["orphans_dropped"]))
+        if result["cycles"]:
+            console.print(f"\n[yellow]Cycles ({len(result['cycles'])}):[/yellow] "
+                          + ", ".join(result["cycles"]))
+        if result["missing_deps"]:
+            console.print(f"\n[yellow]Missing deps:[/yellow]")
+            for declaring, deps in result["missing_deps"].items():
+                console.print(f"  {declaring} → {', '.join(deps)}")
+        if result["diff"]:
+            console.print("\n[bold]Diff:[/bold]")
+            console.print(Syntax(result["diff"], "diff", theme="ansi_dark"))
+        else:
+            console.print("\n[dim]No changes — file is already in canonical form.[/dim]")
+        return
+
+    if do_dry and result["diff"]:
+        console.print(Syntax(result["diff"], "diff", theme="ansi_dark"))
+        console.print("\n[dim]Dry run — no changes made.[/dim]")
+        return
+
+    if result["written"]:
+        added   = len(result["missing_added"])
+        dropped = len(result["orphans_dropped"])
+        bits = []
+        if added:   bits.append(f"+{added}")
+        if dropped: bits.append(f"-{dropped}")
+        suffix = f" ({', '.join(bits)})" if bits else ""
+        console.print(f"[green]✓ {lof_filename} reconciled{suffix}.[/green]")
+    else:
+        console.print("[dim]Load order is already in canonical form.[/dim]")
+
+
+# pin / unpin ─────────────────────────────────────────────────────────────────
+
+@cli.command("pin")
+@click.argument("game")
+@click.argument("folder")
+@click.argument("position", type=click.Choice(["top", "bottom", "before", "after"], case_sensitive=False))
+@click.argument("relative_to", required=False)
+def pin_folder(game, folder, position, relative_to):
+    """Pin FOLDER to a load-order position. Persisted in the DB; applied on every reconcile.
+
+    \b
+    Examples:
+      nexmod pin darktide my_mod top
+      nexmod pin darktide my_mod bottom
+      nexmod pin darktide my_mod before mod_compat
+      nexmod pin darktide my_mod after dmf
+    """
+    position = position.lower()
+    if position in ("before", "after") and not relative_to:
+        console.print(f"[red]'{position}' requires a relative_to folder name.[/red]")
+        sys.exit(1)
+    if position in ("top", "bottom") and relative_to:
+        console.print(f"[yellow]Ignoring relative_to='{relative_to}' for '{position}' pin.[/yellow]")
+        relative_to = None
+
+    db = get_db()
+    db.execute("""
+        INSERT INTO load_order_pins (game, folder, position, relative_to, source, created_at)
+        VALUES (?, ?, ?, ?, 'user', ?)
+        ON CONFLICT(game, folder) DO UPDATE SET
+            position    = excluded.position,
+            relative_to = excluded.relative_to,
+            source      = 'user'
+    """, (game, folder, position, relative_to, now_iso()))
+    db.commit()
+    rel = f" {relative_to}" if relative_to else ""
+    console.print(f"[green]✓ Pinned[/green] {folder} → {position}{rel}")
+    console.print(f"[dim]Run 'nexmod order {game}' to apply.[/dim]")
+
+
+@cli.command("unpin")
+@click.argument("game")
+@click.argument("folder")
+def unpin_folder(game, folder):
+    """Remove a pin previously set with 'nexmod pin'."""
+    db = get_db()
+    cur = db.execute(
+        "DELETE FROM load_order_pins WHERE game=? AND folder=?", (game, folder)
+    )
+    db.commit()
+    if cur.rowcount:
+        console.print(f"[green]✓ Unpinned[/green] {folder}")
+        console.print(f"[dim]Run 'nexmod order {game}' to apply.[/dim]")
+    else:
+        console.print(f"[yellow]No pin found for {folder} on {game}.[/yellow]")
+
+
+@cli.command("pins")
+@click.argument("game")
+def list_pins(game):
+    """Show current load-order pins for GAME."""
+    db = get_db()
+    rows = db.execute(
+        "SELECT folder, position, relative_to, source, created_at "
+        "FROM load_order_pins WHERE game=? ORDER BY created_at",
+        (game,),
+    ).fetchall()
+    if not rows:
+        console.print(f"[dim]No pins set for {game}.[/dim]")
+        return
+    t = Table(title=f"Load-order pins — {game}", show_lines=False, box=None, padding=(0, 1))
+    t.add_column("Folder",      style="bold")
+    t.add_column("Position",    style="cyan")
+    t.add_column("Relative to", style="dim")
+    t.add_column("Source",      style="dim")
+    for r in rows:
+        t.add_row(r["folder"], r["position"], r["relative_to"] or "—", r["source"])
     console.print(t)
 
-    if result["missing_deps"]:
-        console.print("\n[yellow]Missing dependencies (declared but not in load order):[/yellow]")
-        for folder, missing in result["missing_deps"].items():
-            console.print(f"  {folder} → {', '.join(missing)}")
 
-    if cycles:
-        console.print(f"\n[yellow]Dependency cycles ({len(cycles)} mod(s)) placed at end:[/yellow] "
-                      + ", ".join(sorted(cycles)))
-
-    if result["changed"]:
-        if dry_run:
-            console.print("\n[dim]Order would change. Run without --dry-run to apply.[/dim]")
-        else:
-            console.print(f"\n[green]✓ {lof} reordered ({len(order)} mods).[/green]")
-    else:
-        console.print("\n[dim]Order is already correct — no changes needed.[/dim]")
+def _print_classification(classification: dict[str, str]) -> None:
+    """Pretty-print the {folder: class} classification map as a table."""
+    if not classification:
+        console.print("[dim]No entries in load order.[/dim]")
+        return
+    by_class: dict[str, list[str]] = {}
+    for folder, cls in classification.items():
+        by_class.setdefault(cls, []).append(folder)
+    t = Table(title="Load order classification", show_lines=False, box=None, padding=(0, 1))
+    t.add_column("Class",   style="bold")
+    t.add_column("Count",   style="dim", justify="right")
+    t.add_column("Folders", style="dim")
+    order = ["framework", "managed-present", "foreign", "managed-missing", "orphan"]
+    for cls in order:
+        if cls in by_class:
+            folders = by_class[cls]
+            preview = ", ".join(folders[:6]) + (f", … (+{len(folders)-6})" if len(folders) > 6 else "")
+            t.add_row(cls, str(len(folders)), preview)
+    console.print(t)
 
 
 # update ──────────────────────────────────────────────────────────────────────
@@ -1879,24 +3390,35 @@ def update_mods(game, mod_id, yes, no_reorder, fix_deps):
             record(db, "update", game, r["mod_id"], r["name"], latest, "fail", "no download URLs")
             console.print(f"  [red]No download URLs returned — check Premium status.[/red]")
             continue
-        download_url = urls[0].get("URI") or urls[0].get("url")
-        if not download_url:
-            record(db, "update", game, r["mod_id"], r["name"], latest, "fail", f"bad URL format: {urls[0]}")
-            console.print(f"  [red]Unexpected URL format from Nexus — skipping.[/red]")
-            continue
         mod_dir      = resolve_mod_dir(game, db)
         tmp          = DATA_DIR / "tmp"
         tmp.mkdir(parents=True, exist_ok=True)
         archive = tmp / chosen["file_name"]
 
+        size_kb = chosen.get("size_kb") or 0
+        if size_kb > 0:
+            try:
+                size_bytes = size_kb * 1024
+                _check_disk_space(tmp, size_bytes + 50 * 1024 * 1024, "download")
+                if mod_dir.exists():
+                    _check_disk_space(mod_dir, size_bytes * 3, "extraction")
+            except RuntimeError as e:
+                record(db, "update", game, r["mod_id"], r["name"], latest, "fail", str(e))
+                console.print(f"  [red]Skipping: {e}[/red]")
+                continue
+
         extraction_ok = False
         try:
-            download_file(download_url, archive)
+            _try_download_with_mirrors(urls, archive)
             if chosen.get("md5"):
                 verify_md5(archive, chosen["md5"])
             console.print(f"  Extracting to [dim]{mod_dir}[/dim]...")
             extract_archive(archive, mod_dir)
             extraction_ok = True
+            try:
+                _save_snapshot(game, r["mod_id"], latest, archive)
+            except Exception as e:
+                log.warning("snapshot save failed: %s", e)
         except Exception as e:
             record(db, "update", game, r["mod_id"], r["name"], latest, "fail", str(e))
             console.print(f"  [red]Failed: {e}[/red]")
@@ -1923,19 +3445,19 @@ def update_mods(game, mod_id, yes, no_reorder, fix_deps):
     info = GAMES.get(game, {})
     if info.get("load_order_file") and not no_reorder and get_auto_reorder():
         mod_dir = resolve_mod_dir(game, db)
-        lof     = info["load_order_file"]
-        result  = reorder_load_order(mod_dir, lof)
-        if result["changed"]:
-            console.print(f"[dim]Load order sorted ({len(result['order'])} mods)[/dim]")
+        # do_install ran reconcile per-mod. Final reconcile + diagnostic pass.
+        result = reconcile_load_order(game, db, mod_dir)
+        if result["written"]:
+            console.print(f"[dim]Load order sorted.[/dim]")
         if result["cycles"]:
             console.print(f"[yellow]Dependency cycle detected: {', '.join(result['cycles'])}[/yellow]")
+        if result["drift_detected"] and not result["written"]:
+            console.print("[yellow]Load order: external edit detected — not modified.[/yellow]")
         if result["missing_deps"]:
             if fix_deps:
                 newly = _handle_missing_deps(game, result["missing_deps"], mod_dir, api_key, db)
                 if newly:
-                    result2 = reorder_load_order(mod_dir, lof)
-                    if result2["changed"]:
-                        console.print(f"[dim]Load order re-sorted after dependency install[/dim]")
+                    reconcile_load_order(game, db, mod_dir)
             else:
                 n_mods = len(result["missing_deps"])
                 n_deps = sum(len(d) for d in result["missing_deps"].values())
@@ -1955,7 +3477,12 @@ def update_mods(game, mod_id, yes, no_reorder, fix_deps):
 @click.argument("game")
 @click.argument("mod_id", type=int)
 @click.option("--purge", is_flag=True, help="Also delete mod files from disk")
-def remove_mod(game, mod_id, purge):
+@click.option("--yes", "-y", is_flag=True, help="Skip the --purge confirmation prompt")
+@click.option("--force-legacy-purge", is_flag=True,
+              help="Allow --purge on legacy rows that have no recorded folder_name "
+                   "(falls back to filename-stem inference — may delete the wrong folder).")
+@click.option("--dry-run", is_flag=True, help="Show what would be removed without making changes")
+def remove_mod(game, mod_id, purge, yes, force_legacy_purge, dry_run):
     """Stop tracking a mod. Use --purge to also delete its files."""
     db  = get_db()
     row = db.execute("SELECT * FROM mods WHERE game=? AND mod_id=?", (game, mod_id)).fetchone()
@@ -1963,21 +3490,527 @@ def remove_mod(game, mod_id, purge):
         console.print(f"[red]Mod {mod_id} is not tracked for '{game}'.[/red]")
         sys.exit(1)
 
-    if purge and row["mod_dir"] and row["filename"]:
-        mod_dir     = Path(row["mod_dir"])
-        folder_name = row["filename"].rsplit(".", 1)[0]
-        folder      = mod_dir / folder_name
-        if folder.exists() and folder.is_dir():
-            shutil.rmtree(folder)
-            log.info("Purged mod folder %s", folder)
-            console.print(f"[dim]Deleted {folder}[/dim]")
+    if purge and row["mod_dir"]:
+        mod_dir = Path(row["mod_dir"])
+        # Prefer the folder_name column (captured at install). Filename-stem is
+        # the legacy fallback — gated behind --force-legacy-purge because it
+        # can delete the wrong folder when archive names don't map cleanly to
+        # extracted folders (UUID paths, vortex names, etc.).
+        candidates: list[str] = []
+        used_legacy_fallback = False
+        if row["folder_name"]:
+            candidates.append(row["folder_name"])
+        elif force_legacy_purge and row["filename"]:
+            stem = row["filename"].rsplit(".", 1)[0]
+            candidates.append(stem)
+            used_legacy_fallback = True
+
+        if not candidates:
+            console.print(
+                f"[yellow]Cannot purge:[/yellow] no recorded folder_name for [cyan]{row['name']}[/cyan]."
+            )
+            console.print(
+                "  Run [cyan]nexmod fsck[/cyan] to backfill, or pass "
+                "[cyan]--force-legacy-purge[/cyan] to use filename-stem inference (may delete the wrong folder)."
+            )
+            sys.exit(1)
+
+        target = mod_dir / candidates[0]
+        if not target.exists() or not target.is_dir():
+            console.print(
+                f"[yellow]Folder to purge not found:[/yellow] {target}\n"
+                "  Files may already be gone, or the folder was renamed."
+            )
+            # Fall through to DB removal — nothing on disk to delete.
         else:
-            console.print(f"[yellow]Could not find {folder} — remove files manually if needed.[/yellow]")
+            warn = " [yellow](legacy fallback — verify before confirming)[/yellow]" if used_legacy_fallback else ""
+            console.print(f"[bold red]About to delete:[/bold red] {target}{warn}")
+            try:
+                file_count = sum(1 for _ in target.rglob("*"))
+                console.print(f"  [dim]{file_count} file(s) under that folder[/dim]")
+            except Exception:
+                pass
+
+            if dry_run:
+                console.print("[dim](dry-run — no changes made)[/dim]")
+                return
+            if not yes and not click.confirm("Proceed?", default=False):
+                console.print("[dim]Aborted.[/dim]")
+                sys.exit(0)
+            shutil.rmtree(target)
+            log.info("Purged mod folder %s", target)
+            console.print(f"[dim]Deleted {target}[/dim]")
+
+    if dry_run:
+        console.print(f"[dim](dry-run) Would untrack {row['name']} (mod_id={mod_id})[/dim]")
+        return
 
     db.execute("DELETE FROM mods WHERE game=? AND mod_id=?", (game, mod_id))
     db.commit()
     record(db, "remove", game, mod_id, row["name"], row["version"], "ok")
     console.print(f"[green]Removed:[/green] {row['name']}")
+
+    # Reconcile the load order: drops orphaned entries, preserves foreign,
+    # auto-adds discovered framework folders, topo-sorts.
+    info = GAMES.get(game) or {}
+    if info.get("load_order_file") and row["mod_dir"]:
+        try:
+            result = reconcile_load_order(game, db, Path(row["mod_dir"]))
+            dropped = result["orphans_dropped"]
+            if dropped:
+                console.print(f"[dim]Load order: dropped {len(dropped)} orphaned "
+                              f"entr{'y' if len(dropped) == 1 else 'ies'} "
+                              f"({', '.join(dropped)}).[/dim]")
+            elif result["drift_detected"]:
+                console.print("[yellow]Load order: external edit detected — not modified. "
+                              "Run 'nexmod order <game> --check' to review.[/yellow]")
+        except Exception as e:
+            log.warning("reconcile after remove failed: %s", e)
+            console.print(f"[yellow]Load order reconcile failed: {e}[/yellow]")
+
+
+# fsck ────────────────────────────────────────────────────────────────────────
+
+@cli.command("fsck")
+@click.argument("game", required=False)
+@click.option("--fix", is_flag=True, help="Apply fixes (default: dry-run report only).")
+@click.option("--with-api", is_flag=True,
+              help="Also re-fetch missing version strings from Nexus API "
+                   "(requires --fix; one API call per NULL-version row).")
+def fsck(game, fix, with_api):
+    """Audit the local mod database and repair drift.
+
+    Scans tracked mods for: missing folder_name (legacy rows installed before
+    that column existed), missing version, and orphaned mod_dirs (the game's
+    mod folder no longer exists). Reports findings; with --fix, applies them.
+    """
+    db = get_db()
+    q = "SELECT * FROM mods"
+    p: list = []
+    if game:
+        q += " WHERE game = ?"
+        p.append(game)
+    rows = db.execute(q, p).fetchall()
+
+    if not rows:
+        scope = f"for '{game}'" if game else "in DB"
+        console.print(f"[yellow]No mods tracked {scope}.[/yellow]")
+        return
+
+    # Cache mod_dir scans so repeated rows in the same dir don't re-walk it.
+    mod_dir_cache: dict[str, Path | None] = {}
+    def _resolve(mod_dir_str: str | None) -> Path | None:
+        if not mod_dir_str:
+            return None
+        if mod_dir_str not in mod_dir_cache:
+            p = Path(mod_dir_str)
+            mod_dir_cache[mod_dir_str] = p if p.exists() else None
+        return mod_dir_cache[mod_dir_str]
+
+    null_folder: list = []
+    null_version: list = []
+    orphan: list = []
+    inferred: dict[int, tuple[str, str]] = {}        # row_id → (folder, strategy)
+    ambiguous: dict[int, list[str]] = {}              # row_id → candidate folders
+
+    for r in rows:
+        mod_dir = _resolve(r["mod_dir"])
+        if r["mod_dir"] and not mod_dir:
+            orphan.append(r)
+        if not r["folder_name"]:
+            null_folder.append(r)
+            if mod_dir:
+                folder, candidates, strategy = infer_folder_name(mod_dir, r)
+                if folder:
+                    inferred[r["id"]] = (folder, strategy)
+                elif strategy == "ambiguous":
+                    ambiguous[r["id"]] = candidates
+        if not r["version"]:
+            null_version.append(r)
+
+    # Collision check: if two rows point to the same inferred folder, we don't
+    # know which one really owns it — bail out on both rather than guess wrong.
+    folder_to_rids: dict[str, list[int]] = {}
+    for rid, (folder, _) in inferred.items():
+        folder_to_rids.setdefault(folder, []).append(rid)
+    collisions = {f: rs for f, rs in folder_to_rids.items() if len(rs) > 1}
+    for rid_list in collisions.values():
+        for rid in rid_list:
+            inferred.pop(rid, None)
+
+    # Report
+    console.print(f"[bold]nexmod fsck:[/bold] scanned {len(rows)} mod(s)"
+                  f"{' for ' + game if game else ''}")
+    console.print(f"  Missing folder_name : [yellow]{len(null_folder)}[/yellow]")
+    if null_folder:
+        console.print(f"    inferable        : [green]{len(inferred)}[/green]")
+        console.print(f"    ambiguous        : [yellow]{len(ambiguous)}[/yellow]")
+        console.print(f"    collisions       : [red]{len(collisions)}[/red]")
+        console.print(f"    no match         : [dim]{len(null_folder) - len(inferred) - len(ambiguous) - sum(len(v) for v in collisions.values())}[/dim]")
+    console.print(f"  Missing version     : [yellow]{len(null_version)}[/yellow]")
+    console.print(f"  Orphan mod_dir      : [red]{len(orphan)}[/red]")
+
+    if inferred:
+        console.print("\n[bold]Inferred folder names:[/bold]")
+        t = Table(box=None, padding=(0, 1), show_header=True)
+        t.add_column("Mod", style="cyan", overflow="fold")
+        t.add_column("Folder", style="green")
+        t.add_column("Strategy", style="dim")
+        rows_by_id = {r["id"]: r for r in rows}
+        for rid in sorted(inferred):
+            folder, strategy = inferred[rid]
+            t.add_row(rows_by_id[rid]["name"], folder, strategy)
+        console.print(t)
+
+    if ambiguous:
+        console.print("\n[yellow]Ambiguous matches — fix manually with "
+                      "[cyan]sqlite3 ~/.local/share/nexmod/mods.db[/cyan]:[/yellow]")
+        rows_by_id = {r["id"]: r for r in rows}
+        for rid, cands in ambiguous.items():
+            console.print(f"  [cyan]{rows_by_id[rid]['name']}[/cyan]: candidates = {', '.join(cands)}")
+
+    if collisions:
+        console.print("\n[red]Folder collisions (multiple mods would claim the same folder):[/red]")
+        rows_by_id = {r["id"]: r for r in rows}
+        for folder, rid_list in collisions.items():
+            names = [rows_by_id[rid]["name"] for rid in rid_list]
+            console.print(f"  [red]{folder}[/red]: {' | '.join(names)}")
+
+    if orphan:
+        console.print("\n[red]Orphan rows (mod_dir does not exist):[/red]")
+        for r in orphan[:10]:
+            console.print(f"  [dim]{r['name']} → {r['mod_dir']}[/dim]")
+        if len(orphan) > 10:
+            console.print(f"  [dim]…+{len(orphan) - 10} more[/dim]")
+
+    if not fix:
+        console.print("\n[dim]Dry-run only. Re-run with [cyan]--fix[/cyan] to apply.[/dim]")
+        return
+
+    # Apply
+    applied_folders = 0
+    for rid, (folder, _) in inferred.items():
+        db.execute("UPDATE mods SET folder_name = ? WHERE id = ?", (folder, rid))
+        applied_folders += 1
+
+    applied_versions = 0
+    if with_api and null_version:
+        api_key = get_api_key()
+        with console.status(f"Re-fetching {len(null_version)} version(s)..."):
+            for r in null_version:
+                info = GAMES.get(r["game"], {})
+                domain = info.get("domain", r["game"])
+                try:
+                    mod = api_mod_info(domain, r["mod_id"], api_key)
+                    latest = mod.get("version")
+                    if latest:
+                        db.execute("UPDATE mods SET version = ? WHERE id = ?", (latest, r["id"]))
+                        applied_versions += 1
+                except Exception as e:
+                    log.warning("fsck: version refetch failed for %s: %s", r["name"], e)
+
+    db.commit()
+    console.print(
+        f"\n[green]Applied:[/green] {applied_folders} folder_name, {applied_versions} version"
+    )
+    record(db, "fsck", game or "*", None, None, None, "ok",
+           f"folder_name={applied_folders} version={applied_versions}")
+
+
+# rollback / snapshots ────────────────────────────────────────────────────────
+
+@cli.command("snapshots")
+@click.argument("game")
+@click.argument("mod_id", type=int, required=False, default=None)
+@click.option("--prune", is_flag=True,
+              help=f"Force-prune to {SNAPSHOTS_PER_MOD} most-recent snapshots per mod.")
+def snapshots(game, mod_id, prune):
+    """List cached version snapshots used by `nexmod rollback`.
+
+    Snapshots are written automatically after each successful install/update,
+    capped to the most-recent SNAPSHOTS_PER_MOD per mod (default 3).
+    """
+    db = get_db()
+    if mod_id is None:
+        rows = db.execute(
+            "SELECT mod_id, name FROM mods WHERE game = ? ORDER BY name", (game,)
+        ).fetchall()
+    else:
+        rows = db.execute(
+            "SELECT mod_id, name FROM mods WHERE game = ? AND mod_id = ?",
+            (game, mod_id),
+        ).fetchall()
+
+    if not rows:
+        scope = f"mod {mod_id}" if mod_id else f"any mod"
+        console.print(f"[yellow]No tracked records found for {scope} in {game}.[/yellow]")
+        return
+
+    total_snaps = 0
+    total_pruned = 0
+    t = Table(title=f"Snapshot cache — {game}", box=None, padding=(0, 1))
+    t.add_column("Mod", style="cyan")
+    t.add_column("Versions", style="dim")
+    t.add_column("Total size", style="dim", justify="right")
+    for r in rows:
+        snaps = _list_snapshots(game, r["mod_id"])
+        if not snaps:
+            continue
+        if prune:
+            total_pruned += _prune_snapshots(game, r["mod_id"])
+            snaps = _list_snapshots(game, r["mod_id"])
+        labels = ", ".join(_snapshot_version_label(s) for s in snaps)
+        size_kb = sum(s.stat().st_size for s in snaps) // 1024
+        t.add_row(r["name"], labels, f"{size_kb} KB")
+        total_snaps += len(snaps)
+
+    if total_snaps == 0:
+        console.print(f"[dim]No snapshots cached yet for {game}.[/dim]")
+        return
+    console.print(t)
+    console.print(f"\n[dim]Total: {total_snaps} snapshot(s)"
+                  f"{f', pruned {total_pruned}' if prune else ''}.[/dim]")
+
+
+@cli.command("rollback")
+@click.argument("game")
+@click.argument("mod_id", type=int)
+@click.option("--version", help="Specific version to restore "
+              "(default: most recent prior to current).")
+@click.option("--list", "list_only", is_flag=True,
+              help="Just list snapshots; don't restore anything.")
+@click.option("--yes", "-y", is_flag=True, help="Skip confirmation prompt.")
+def rollback(game, mod_id, version, list_only, yes):
+    """Restore a previous version of a tracked mod from snapshot cache.
+
+    Use [cyan]nexmod snapshots[/cyan] to see what's available. If no --version
+    is passed, rolls back to the most recent prior version.
+    """
+    db = get_db()
+    row = db.execute(
+        "SELECT * FROM mods WHERE game=? AND mod_id=?", (game, mod_id)
+    ).fetchone()
+    if not row:
+        console.print(f"[red]Mod {mod_id} is not tracked for '{game}'.[/red]")
+        sys.exit(1)
+
+    snaps = _list_snapshots(game, mod_id)
+    if not snaps:
+        console.print(
+            f"[yellow]No snapshots cached for {row['name']}.[/yellow]\n"
+            "Snapshots are saved automatically after each install/update — "
+            "this mod was likely installed before snapshot caching existed."
+        )
+        sys.exit(1)
+
+    console.print(f"[bold]Snapshots for {row['name']} (mod {mod_id}):[/bold]")
+    for snap in snaps:
+        ts = datetime.fromtimestamp(snap.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
+        label = _snapshot_version_label(snap)
+        marker = " [green](current)[/green]" if label == _safe_filename_part(row["version"] or "") else ""
+        console.print(f"  [cyan]{label}[/cyan]  [dim]{ts}, "
+                      f"{snap.stat().st_size // 1024} KB[/dim]{marker}")
+
+    if list_only:
+        return
+
+    # Pick target
+    if version:
+        target = next((s for s in snaps if _snapshot_version_label(s) == version), None)
+        if not target:
+            console.print(f"\n[red]Version {version} not found in snapshots.[/red]")
+            sys.exit(1)
+    else:
+        current_norm = _safe_filename_part(row["version"] or "")
+        non_current = [s for s in snaps if _snapshot_version_label(s) != current_norm]
+        if not non_current:
+            console.print(
+                f"\n[yellow]No prior snapshot to roll back to "
+                f"(only the current version is cached).[/yellow]"
+            )
+            sys.exit(1)
+        target = non_current[0]
+
+    target_label = _snapshot_version_label(target)
+    console.print(f"\n[bold]Will restore:[/bold] {target_label}")
+
+    mod_dir = Path(row["mod_dir"])
+    if row["folder_name"]:
+        existing = mod_dir / row["folder_name"]
+        if existing.exists():
+            console.print(f"  Will first remove [dim]{existing}[/dim] for clean restore")
+
+    if not yes and not click.confirm("Proceed?", default=False):
+        console.print("[dim]Aborted.[/dim]")
+        sys.exit(0)
+
+    # Best-effort clean-out of existing folder so leftover files from the
+    # newer version don't shadow the older version's files.
+    if row["folder_name"]:
+        existing = mod_dir / row["folder_name"]
+        if existing.exists():
+            shutil.rmtree(existing)
+            log.info("Removed existing folder for rollback: %s", existing)
+
+    extract_archive(target, mod_dir)
+    db.execute(
+        "UPDATE mods SET version=?, updated_at=? WHERE game=? AND mod_id=?",
+        (target_label, now_iso(), game, mod_id),
+    )
+    db.commit()
+    record(db, "rollback", game, mod_id, row["name"], target_label, "ok")
+    console.print(f"[green]✓ Rolled back to {target_label}[/green]")
+
+
+# nxm:// link handler ─────────────────────────────────────────────────────────
+
+NXM_DESKTOP_FILE = """[Desktop Entry]
+Type=Application
+Name=nexmod NXM Handler
+Comment=Handle nxm:// download links from Nexus Mods
+Exec={nexmod_bin} nxm %u
+Icon=applications-internet
+Terminal=true
+NoDisplay=true
+MimeType=x-scheme-handler/nxm;
+"""
+
+NXM_DESKTOP_PATH = Path.home() / ".local/share/applications/nexmod-nxm.desktop"
+
+
+def _parse_nxm_uri(uri: str) -> dict:
+    """Parse nxm://<domain>/mods/<mod_id>/files/<file_id>?key=…&expires=…&user_id=… .
+
+    Raises ValueError on malformed URIs. The query-string params are forwarded
+    to the Nexus API for free-user downloads but are unused for Premium.
+    """
+    from urllib.parse import urlparse, parse_qs
+    parsed = urlparse(uri)
+    if parsed.scheme != "nxm":
+        raise ValueError(f"not an nxm:// URI (scheme={parsed.scheme!r})")
+    domain = parsed.netloc
+    parts = parsed.path.strip("/").split("/")
+    if len(parts) < 4 or parts[0] != "mods" or parts[2] != "files":
+        raise ValueError(f"unexpected NXM path: {parsed.path!r}")
+    try:
+        mod_id = int(parts[1])
+        file_id = int(parts[3])
+    except ValueError as e:
+        raise ValueError(
+            f"mod_id/file_id not integers: {parts[1]!r}, {parts[3]!r}"
+        ) from e
+    qs = parse_qs(parsed.query)
+    return {
+        "domain":  domain,
+        "mod_id":  mod_id,
+        "file_id": file_id,
+        "key":     qs.get("key",     [None])[0],
+        "expires": qs.get("expires", [None])[0],
+        "user_id": qs.get("user_id", [None])[0],
+    }
+
+
+@cli.command("nxm")
+@click.argument("uri")
+@click.option("--no-reorder", is_flag=True,
+              help="Skip automatic load order sort after install")
+def nxm_handle(uri, no_reorder):
+    """Handle an nxm:// URI (Nexus 'Mod Manager Download' button).
+
+    Usually invoked by the system handler after running
+    [cyan]nexmod nxm-register[/cyan]. You can also paste a URI manually.
+    """
+    try:
+        parsed = _parse_nxm_uri(uri)
+    except ValueError as e:
+        console.print(f"[red]Invalid NXM URI:[/red] {e}")
+        sys.exit(1)
+
+    domain_to_game = {info["domain"]: slug for slug, info in GAMES.items()}
+    game = domain_to_game.get(parsed["domain"], parsed["domain"])
+    if game == parsed["domain"] and parsed["domain"] not in GAMES:
+        console.print(
+            f"[yellow]Unknown game domain[/yellow] [cyan]{parsed['domain']}[/cyan] — "
+            f"will try as game slug. Set mod dir with: "
+            f"nexmod path set {parsed['domain']} /path/to/mods"
+        )
+
+    console.print(
+        f"[bold]NXM:[/bold] {parsed['domain']}/mods/{parsed['mod_id']}/files/{parsed['file_id']}"
+    )
+
+    api_key = get_api_key()
+    db = get_db()
+    name, version = do_install(game, parsed["mod_id"], parsed["file_id"], api_key, db)
+    console.print(f"\n[green]✓ Installed:[/green] {name} v{version}")
+
+
+@cli.command("nxm-register")
+def nxm_register():
+    """Register nexmod as the system handler for nxm:// links.
+
+    Writes a .desktop file to ~/.local/share/applications/, updates the MIME
+    database, and sets nexmod as the default handler for x-scheme-handler/nxm.
+    After this, the 'Mod Manager Download' button on Nexus mod pages launches
+    nexmod automatically.
+    """
+    nexmod_bin = shutil.which("nexmod") or sys.argv[0]
+    if not Path(nexmod_bin).is_absolute():
+        console.print(
+            f"[yellow]Warning:[/yellow] nexmod binary path is not absolute "
+            f"({nexmod_bin}). The handler may break if your shell PATH changes."
+        )
+
+    NXM_DESKTOP_PATH.parent.mkdir(parents=True, exist_ok=True)
+    NXM_DESKTOP_PATH.write_text(NXM_DESKTOP_FILE.format(nexmod_bin=nexmod_bin))
+    console.print(f"[green]✓[/green] Wrote {NXM_DESKTOP_PATH}")
+
+    # update-desktop-database picks up the new MimeType= entry
+    try:
+        subprocess.run(
+            ["update-desktop-database", str(NXM_DESKTOP_PATH.parent)],
+            check=True, capture_output=True,
+        )
+        console.print("[green]✓[/green] Updated desktop database")
+    except (subprocess.CalledProcessError, FileNotFoundError) as e:
+        console.print(f"[yellow]Could not update desktop database: {e}[/yellow]")
+        console.print("  Install [cyan]desktop-file-utils[/cyan] for full integration.")
+
+    # xdg-mime sets us as default for the scheme
+    try:
+        subprocess.run(
+            ["xdg-mime", "default", "nexmod-nxm.desktop", "x-scheme-handler/nxm"],
+            check=True, capture_output=True,
+        )
+        console.print("[green]✓[/green] Set as default handler for nxm:// links")
+    except (subprocess.CalledProcessError, FileNotFoundError) as e:
+        console.print(f"[yellow]Could not set default handler: {e}[/yellow]")
+        console.print(
+            "  Run manually: [cyan]xdg-mime default nexmod-nxm.desktop "
+            "x-scheme-handler/nxm[/cyan]"
+        )
+
+    console.print(
+        "\n[bold]Done.[/bold] Click 'Mod Manager Download' on any Nexus mod "
+        "page to test."
+    )
+
+
+@cli.command("nxm-unregister")
+def nxm_unregister():
+    """Remove the nexmod NXM handler registration."""
+    if NXM_DESKTOP_PATH.exists():
+        NXM_DESKTOP_PATH.unlink()
+        console.print(f"[green]✓[/green] Removed {NXM_DESKTOP_PATH}")
+        try:
+            subprocess.run(
+                ["update-desktop-database", str(NXM_DESKTOP_PATH.parent)],
+                check=True, capture_output=True,
+            )
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            pass
+    else:
+        console.print(f"[yellow]No registration found at {NXM_DESKTOP_PATH}[/yellow]")
 
 
 # enable / disable / toggle ───────────────────────────────────────────────────

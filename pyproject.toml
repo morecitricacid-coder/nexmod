@@ -38,10 +38,6 @@ dev = [
 [project.scripts]
 nexmod = "nexmod:cli"
 
-[project.urls]
-"Bug Tracker" = "https://github.com/YOUR_USERNAME/nexmod/issues"
-"Source" = "https://github.com/YOUR_USERNAME/nexmod"
-
 [tool.setuptools]
 py-modules = ["nexmod"]
 

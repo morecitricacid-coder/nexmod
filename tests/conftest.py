@@ -26,6 +26,12 @@ def isolated_dirs(tmp_path, monkeypatch):
     monkeypatch.setattr(nexmod, "LOG_FILE",    data_dir  / "nexmod.log")
     monkeypatch.setattr(nexmod, "WINE_PREFIX", data_dir  / "wine-prefix")
 
+    # Network retry sleeps must be zero in tests — otherwise the suite runs
+    # at the speed of exponential backoff. Tests that need real timing
+    # behavior should override these inside the test.
+    monkeypatch.setattr(nexmod, "NEXUS_RETRY_BASE_DELAY", 0.0)
+    monkeypatch.setattr(nexmod.time, "sleep", lambda *_a, **_kw: None)
+
     yield tmp_path
 
     # Prevent RotatingFileHandler objects from accumulating across tests.
