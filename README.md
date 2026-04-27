@@ -1,5 +1,7 @@
 # nexmod
 
+[![CI](https://github.com/morecitricacid-coder/nexmod/actions/workflows/ci.yml/badge.svg)](https://github.com/morecitricacid-coder/nexmod/actions/workflows/ci.yml)
+
 A Linux-native CLI mod manager for [Nexus Mods](https://www.nexusmods.com/).
 
 > **Requires a Nexus Mods Premium account** — the download API is Premium-only.
@@ -63,7 +65,7 @@ pip install --user nexmod
 ### From source
 
 ```bash
-git clone <repo-url>
+git clone https://github.com/morecitricacid-coder/nexmod
 cd nexmod
 pip install -e . --user
 ```

@@ -26,6 +26,8 @@ from rich.table import Table
 from rich.progress import Progress, DownloadColumn, TransferSpeedColumn, BarColumn, TextColumn
 from rich.syntax import Syntax
 
+__version__ = "0.3.0"
+
 console = Console()
 log = logging.getLogger("nexmod")
 
@@ -1997,6 +1999,7 @@ def _empty_reconcile_result() -> dict:
 @click.group()
 @click.option("--verbose", "-v", is_flag=True, default=False,
               help="Print debug output to terminal (always logged to file).")
+@click.version_option(version=__version__, prog_name="nexmod")
 @click.pass_context
 def cli(ctx, verbose):
     """nexmod — download and update Nexus mods on Linux (Premium required)"""
