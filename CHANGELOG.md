@@ -8,8 +8,23 @@ All notable changes to nexmod are documented here. Format follows
 
 ## [Unreleased]
 
+### Added
+- `nexmod history` now accepts `--json` / `-j` flag; emits a JSON array of history records for programmatic consumption by LLM agents and scripts.
+- `nexmod search` now shows an `Inst.` column (human table) and `"installed": bool` field (JSON) indicating whether each result is already tracked in the local DB.
+- `nexmod profile save` now embeds a `"mods"` list in the saved profile JSON — each entry records `mod_id`, `name`, `version`, `folder_name`, and `domain`. Allows `profile load --install` to re-download mods on a clean machine without needing a pre-existing DB.
+- `nexmod profile load --install` prefers the embedded `"mods"` list when present; falls back to DB lookup for profiles saved by older versions (backward compatible).
+
 ### Fixed
+- `nexmod enable`/`disable`/`toggle` on non-Darktide games now exits immediately with a clear message ("does not use dtkit-patch — enable/disable/toggle is Darktide-only") instead of reaching into `_run_dtkit` and producing a confusing `dtkit-patch.exe not found` error.
+- `nexmod diag darktide` now warns when bundle files are newer than `dtkit-patch.exe`, indicating a game update may have reset mod support. Re-running `nexmod enable darktide` is suggested.
+- Version comparisons in `check` and `update` now normalize versions before comparing: `"1.0"` == `"1.00"` == `"1"`, `"v1.2"` == `"1.2"`. Trailing zero segments and leading `v` prefixes no longer produce false "update available" results.
+- `_handle_missing_deps`: when a dep is not in the local DB, the prompt now also prints a `nexmod search <game> <dep>` hint to help users find the dependency.
+
+### Security
 - **Security:** `.7z` archives now have path-traversal protection — contents are listed via `7z l -slt` before extraction; any member with an absolute path or `..` component raises `RuntimeError`. Zip and tar already had this check; `.7z` was the gap.
+
+### Notes
+- Flatpak Steam users: `nexmod nxm-register` now prints a warning when `~/.var/app/com.valvesoftware.Steam` is detected, explaining that Flatpak browser isolation may prevent NXM link dispatch and providing a manual workaround.
 
 ---
 

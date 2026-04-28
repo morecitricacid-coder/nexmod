@@ -1773,3 +1773,191 @@ class TestSafetyGuards:
         assert result.exit_code == 0 or "aborted" in result.output.lower()
         # File should still exist
         assert folder.exists()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Fix 3: enable/disable/toggle wrong-game guard
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestEnableDisableToggleWrongGame:
+    """enable/disable/toggle must exit non-zero with a helpful message for non-Darktide games."""
+
+    def test_enable_non_darktide_exits_nonzero(self, runner):
+        result = runner.invoke(cli, ["enable", "skyrimse"])
+        assert result.exit_code != 0
+        assert "darktide" in result.output.lower() or "dtkit" in result.output.lower()
+
+    def test_enable_non_darktide_message_contains_dtkit(self, runner):
+        result = runner.invoke(cli, ["enable", "bg3"])
+        assert result.exit_code != 0
+        assert "dtkit-patch" in result.output
+
+    def test_disable_non_darktide_exits_nonzero(self, runner):
+        result = runner.invoke(cli, ["disable", "skyrimse"])
+        assert result.exit_code != 0
+        assert "dtkit-patch" in result.output
+
+    def test_toggle_non_darktide_exits_nonzero(self, runner):
+        result = runner.invoke(cli, ["toggle", "cyberpunk2077"])
+        assert result.exit_code != 0
+        assert "dtkit-patch" in result.output
+
+    def test_enable_darktide_not_blocked(self, runner, darktide_mod_dir):
+        """enable darktide should NOT be blocked by the guard — it proceeds to dtkit."""
+        with patch("nexmod._run_dtkit", return_value=(True, "patched")):
+            result = runner.invoke(cli, ["enable", "darktide"])
+        assert result.exit_code == 0
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Fix 4: diag bundle-reset detection for Darktide
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestDiagBundleResetWarning:
+    """diag for Darktide warns when bundle files are newer than dtkit-patch."""
+
+    def _make_game_tree(self, tmp_path):
+        """Create a minimal fake Darktide install tree."""
+        game_dir = tmp_path / "darktide"
+        mod_dir  = game_dir / "mods"
+        mod_dir.mkdir(parents=True)
+        tools    = game_dir / "tools"
+        tools.mkdir()
+        bundle   = game_dir / "bundle"
+        bundle.mkdir()
+        dtkit    = tools / "dtkit-patch.exe"
+        dtkit.write_bytes(b"x")
+        return game_dir, mod_dir, bundle, dtkit
+
+    def test_bundle_newer_than_dtkit_shows_warning(self, runner, tmp_path, monkeypatch):
+        """When a bundle file is newer than dtkit-patch, diag should warn."""
+        game_dir, mod_dir, bundle, dtkit = self._make_game_tree(tmp_path)
+
+        # Make a fake game log.
+        log_dir = tmp_path / "logs"
+        log_dir.mkdir()
+        game_log = log_dir / "darktide.log"
+        game_log.write_text("some log content\n")
+
+        # Register path in DB so resolve_mod_dir works.
+        db = nexmod.get_db()
+        db.execute(
+            "INSERT OR REPLACE INTO game_paths (game, path) VALUES (?, ?)",
+            ("darktide", str(mod_dir)),
+        )
+        db.commit()
+
+        # dtkit_mtime = 100, bundle_file_mtime = 200 → bundle is newer.
+        bundle_file = bundle / "content.bundle"
+        bundle_file.write_bytes(b"x")
+
+        import os
+        os.utime(dtkit, (100.0, 100.0))
+        os.utime(bundle_file, (200.0, 200.0))
+
+        # Patch resolve_mod_dir and diag's log-finding to point to our fake log.
+        monkeypatch.setattr(nexmod, "resolve_mod_dir", lambda g, d: mod_dir)
+        monkeypatch.setattr(nexmod, "find_proton_appdata", lambda sid: None)
+
+        # Override diag's log-path lookup to return our fake log.
+        orig_games = nexmod.GAMES
+        fake_games = dict(orig_games)
+        fake_games["darktide"] = dict(orig_games["darktide"])
+        fake_games["darktide"]["log_subpath"] = str(game_log)
+        monkeypatch.setattr(nexmod, "GAMES", fake_games)
+
+        # Also make the XDG path lookup find our log directly.
+        def fake_exists_log(path, game_log=game_log):
+            return path == game_log
+
+        # Patch Path.exists — too invasive. Instead override the log resolution.
+        # Simpler: monkeypatch find_proton_appdata to return the log's parent.
+        monkeypatch.setattr(nexmod, "find_proton_appdata",
+                            lambda sid: log_dir)
+
+        result = runner.invoke(cli, ["diag", "darktide"])
+        assert result.exit_code == 0, result.output
+        assert "bundle" in result.output.lower() or "enable darktide" in result.output
+
+    def test_bundle_older_than_dtkit_no_warning(self, runner, tmp_path, monkeypatch):
+        """When dtkit-patch is newer than all bundle files, no warning shown."""
+        game_dir, mod_dir, bundle, dtkit = self._make_game_tree(tmp_path)
+
+        log_dir = tmp_path / "logs"
+        log_dir.mkdir()
+        game_log = log_dir / "darktide.log"
+        game_log.write_text("clean log\n")
+
+        db = nexmod.get_db()
+        db.execute(
+            "INSERT OR REPLACE INTO game_paths (game, path) VALUES (?, ?)",
+            ("darktide", str(mod_dir)),
+        )
+        db.commit()
+
+        bundle_file = bundle / "content.bundle"
+        bundle_file.write_bytes(b"x")
+
+        import os
+        os.utime(bundle_file, (100.0, 100.0))
+        os.utime(dtkit, (200.0, 200.0))   # dtkit is NEWER — no warning
+
+        monkeypatch.setattr(nexmod, "resolve_mod_dir", lambda g, d: mod_dir)
+        monkeypatch.setattr(nexmod, "find_proton_appdata",
+                            lambda sid: log_dir)
+
+        fake_games = dict(nexmod.GAMES)
+        fake_games["darktide"] = dict(nexmod.GAMES["darktide"])
+        fake_games["darktide"]["log_subpath"] = str(game_log)
+        monkeypatch.setattr(nexmod, "GAMES", fake_games)
+
+        result = runner.invoke(cli, ["diag", "darktide"])
+        assert result.exit_code == 0, result.output
+        assert "enable darktide" not in result.output
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Fix 5: history --json
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestHistoryJson:
+    """history --json emits valid JSON with the expected schema."""
+
+    def test_history_json_empty_returns_empty_list(self, runner, darktide_mod_dir):
+        result = runner.invoke(cli, ["history", "darktide", "--json"])
+        assert result.exit_code == 0
+        out = json.loads(result.output)
+        assert out == []
+
+    def test_history_json_has_expected_fields(self, runner, darktide_mod_dir):
+        nexmod.record(nexmod.get_db(), "install", "darktide", 42, "Some Mod", "1.5", "ok")
+        result = runner.invoke(cli, ["history", "darktide", "--json"])
+        assert result.exit_code == 0
+        rows = json.loads(result.output)
+        assert len(rows) == 1
+        row = rows[0]
+        assert row["action"] == "install"
+        assert row["game"] == "darktide"
+        assert row["mod_id"] == 42
+        assert row["mod_name"] == "Some Mod"
+        assert row["version"] == "1.5"
+        assert row["status"] == "ok"
+
+    def test_history_json_respects_failures_filter(self, runner, darktide_mod_dir):
+        db = nexmod.get_db()
+        nexmod.record(db, "install", "darktide", 1, "Good", "1.0", "ok")
+        nexmod.record(db, "install", "darktide", 2, "Bad",  "1.0", "fail")
+        result = runner.invoke(cli, ["history", "darktide", "--json", "--failures"])
+        assert result.exit_code == 0
+        rows = json.loads(result.output)
+        assert len(rows) == 1
+        assert rows[0]["mod_name"] == "Bad"
+
+    def test_history_json_respects_limit(self, runner, darktide_mod_dir):
+        db = nexmod.get_db()
+        for i in range(5):
+            nexmod.record(db, "install", "darktide", i, f"Mod {i}", "1.0", "ok")
+        result = runner.invoke(cli, ["history", "darktide", "--json", "--limit", "3"])
+        assert result.exit_code == 0
+        rows = json.loads(result.output)
+        assert len(rows) == 3

@@ -355,3 +355,97 @@ def test_profile_load_records_active_profile(tmp_path, monkeypatch, runner, api_
     ).fetchone()
     assert row is not None
     assert row["active_profile"] == "combat"
+
+
+# ── Fix 1: profile_save stores mod IDs + profile_load uses them ───────────────
+
+def test_profile_save_includes_mods_list(tmp_path, monkeypatch, runner, api_key_config):
+    """profile save should include a 'mods' list with mod_id/name/version/folder_name/domain."""
+    mod_dir = tmp_path / "mods"
+    mod_dir.mkdir()
+    (mod_dir / "CoolMod").mkdir()
+    lof = mod_dir / "mod_load_order.txt"
+    lof.write_text("CoolMod\n")
+
+    db = nexmod.get_db()
+    db.execute("""
+        INSERT INTO mods (game, mod_id, file_id, name, version, filename, folder_name, mod_dir, tracked_at)
+        VALUES ('darktide', 999, 1, 'Cool Mod', '2.1', 'CoolMod.zip', 'CoolMod', ?, '2026-01-01')
+    """, (str(mod_dir),))
+    db.commit()
+
+    monkeypatch.setattr(nexmod, "PROFILES_DIR", tmp_path / "profiles")
+    monkeypatch.setattr(nexmod, "resolve_mod_dir", lambda g, d: mod_dir)
+
+    result = runner.invoke(nexmod.cli, ["profile", "save", "darktide", "testprof"],
+                           catch_exceptions=False)
+    assert result.exit_code == 0, result.output
+
+    profile_path = tmp_path / "profiles" / "darktide" / "testprof.json"
+    assert profile_path.exists()
+    data = json.loads(profile_path.read_text())
+    assert "mods" in data
+    assert len(data["mods"]) == 1
+    entry = data["mods"][0]
+    assert entry["mod_id"] == 999
+    assert entry["name"] == "Cool Mod"
+    assert entry["version"] == "2.1"
+    assert entry["folder_name"] == "CoolMod"
+    assert entry["domain"] == "warhammer40kdarktide"
+
+
+def test_profile_load_install_uses_mods_list(tmp_path, monkeypatch, runner, api_key_config):
+    """--install should use mod_ids from the profile's 'mods' key on a clean DB."""
+    mod_dir = tmp_path / "mods"
+    mod_dir.mkdir()
+    # ModA exists on disk; ModB is missing.
+    (mod_dir / "ModA").mkdir()
+
+    monkeypatch.setattr(nexmod, "PROFILES_DIR", tmp_path / "profiles")
+    # Write profile with embedded mods list (as profile_save would generate).
+    nexmod._write_profile(
+        "darktide", "restore",
+        load_order=["ModA", "ModB"],
+        mods=[
+            {"mod_id": 101, "name": "Mod A", "version": "1.0",
+             "folder_name": "ModA", "domain": "warhammer40kdarktide"},
+            {"mod_id": 202, "name": "Mod B", "version": "1.0",
+             "folder_name": "ModB", "domain": "warhammer40kdarktide"},
+        ],
+    )
+    monkeypatch.setattr(nexmod, "resolve_mod_dir", lambda g, d: mod_dir)
+
+    calls: list[tuple] = []
+
+    def fake_install(game, mod_id, file_id, api_key, db):
+        calls.append((game, mod_id, file_id))
+        (mod_dir / "ModB").mkdir(exist_ok=True)
+        return ("Mod B", "1.0")
+
+    monkeypatch.setattr(nexmod, "do_install", fake_install)
+
+    result = runner.invoke(nexmod.cli, ["profile", "load", "darktide", "restore", "--install"],
+                           catch_exceptions=False)
+
+    assert result.exit_code == 0, result.output
+    # Should have installed ModB (id=202) without touching the DB.
+    assert calls == [("darktide", 202, None)], f"unexpected install calls: {calls}"
+
+
+def test_write_profile_mods_none_omits_key(tmp_path, monkeypatch):
+    """_write_profile with mods=None should not write a 'mods' key at all."""
+    monkeypatch.setattr(nexmod, "PROFILES_DIR", tmp_path / "profiles")
+    nexmod._write_profile("darktide", "nokey", ["FolderX"])
+    path = tmp_path / "profiles" / "darktide" / "nokey.json"
+    data = json.loads(path.read_text())
+    assert "mods" not in data
+
+
+def test_write_profile_mods_empty_list_written(tmp_path, monkeypatch):
+    """_write_profile with mods=[] should write an empty list."""
+    monkeypatch.setattr(nexmod, "PROFILES_DIR", tmp_path / "profiles")
+    nexmod._write_profile("darktide", "emptykey", ["FolderX"], mods=[])
+    path = tmp_path / "profiles" / "darktide" / "emptykey.json"
+    data = json.loads(path.read_text())
+    assert "mods" in data
+    assert data["mods"] == []

@@ -339,3 +339,50 @@ class TestInfoRemote:
         result = runner.invoke(cli, ["info", "darktide", "8888"])
         assert result.exit_code != 0
         assert "not tracked" in result.output.lower()
+
+
+# ── Fix 2: search shows installed state ──────────────────────────────────────
+
+class TestSearchInstalledState:
+    """search --json includes 'installed': true when the mod is in the local DB."""
+
+    def test_json_installed_true_for_tracked_mod(self, runner, api_key_config, monkeypatch):
+        """installed=true when the mod_id is already in the DB."""
+        db = nexmod.get_db()
+        db.execute("""
+            INSERT INTO mods (game, mod_id, file_id, name, mod_dir, tracked_at)
+            VALUES ('darktide', 1234, 1, 'Installed Mod', '/tmp', '2026-01-01')
+        """)
+        db.commit()
+
+        _mock_post(monkeypatch, _graphql_response([_node(mod_id=1234)]))
+        result = runner.invoke(cli, ["search", "darktide", "test", "--json"])
+        assert result.exit_code == 0, result.output
+        out = json.loads(result.output)
+        assert len(out) == 1
+        assert out[0]["installed"] is True
+
+    def test_json_installed_false_for_untracked_mod(self, runner, api_key_config, monkeypatch):
+        """installed=false when the mod_id is not in the DB."""
+        _mock_post(monkeypatch, _graphql_response([_node(mod_id=9999)]))
+        result = runner.invoke(cli, ["search", "darktide", "test", "--json"])
+        assert result.exit_code == 0
+        out = json.loads(result.output)
+        assert len(out) == 1
+        assert out[0]["installed"] is False
+
+    def test_json_schema_has_installed_field(self, runner, api_key_config, monkeypatch):
+        """Every JSON result object must have an 'installed' key."""
+        _mock_post(monkeypatch, _graphql_response([_node(mod_id=111), _node(mod_id=222)]))
+        result = runner.invoke(cli, ["search", "darktide", "test", "--json"])
+        assert result.exit_code == 0
+        out = json.loads(result.output)
+        for item in out:
+            assert "installed" in item
+
+    def test_table_shows_inst_column(self, runner, api_key_config, monkeypatch):
+        """Human-readable output should include the 'Inst.' column header."""
+        _mock_post(monkeypatch, _graphql_response([_node(mod_id=111)]))
+        result = runner.invoke(cli, ["search", "darktide", "test"])
+        assert result.exit_code == 0
+        assert "Inst." in result.output

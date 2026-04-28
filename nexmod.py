@@ -327,6 +327,19 @@ def _backoff_delay(attempt: int, base: float = NEXUS_RETRY_BASE_DELAY) -> float:
     return base * (2 ** (attempt - 1))
 
 
+def _norm_version(v: str) -> str:
+    """Normalize a mod version string for comparison.
+
+    Strips leading 'v', lowercases, and removes trailing '.0' segments so that
+    "1.0" == "1.00" == "1" and "v1.2" == "1.2" while "1.2.1" stays "1.2.1".
+    """
+    v = (v or "").strip().lower().lstrip("v")
+    parts = v.split(".")
+    while len(parts) > 1 and parts[-1] in ("0", "00", "000"):
+        parts.pop()
+    return ".".join(parts)
+
+
 def nexus_get(endpoint: str, api_key: str) -> dict | list:
     """GET a Nexus API endpoint with retry + 429 backoff.
 
@@ -1327,6 +1340,7 @@ def _handle_missing_deps(
 
         # DB miss — prompt for URL
         console.print(f"  [dim]'{dep}' not in local DB. Paste a Nexus URL to install it:[/dim]")
+        console.print(f"  [dim]Or search for it: nexmod search {game} {dep}[/dim]")
         url = click.prompt(
             f"  Paste the Nexus URL for '{dep}' to install it (Enter to skip)",
             default="",
@@ -1915,6 +1929,7 @@ def _read_profile(game: str, name: str) -> dict:
 def _write_profile(
     game: str, name: str, load_order: list[str],
     description: str = "", directives: list[str] | None = None,
+    mods: "list[dict] | None" = None,
 ) -> Path:
     path = _profile_path(game, name)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -1933,6 +1948,8 @@ def _write_profile(
         "load_order":  load_order,
         "directives":  directives or [],
     }
+    if mods is not None:
+        data["mods"] = mods
     path.write_text(json.dumps(data, indent=2))
     return path
 
@@ -2736,7 +2753,31 @@ def profile_save(game, name, description, force):
             f"(cannot be auto-installed via --install): {label}"
         )
 
-    _write_profile(game, name, folders, description, directive_lines)
+    # Build mod list from DB for restore/share on a clean machine.
+    rows = db.execute(
+        "SELECT mod_id, name, version, filename, folder_name FROM mods WHERE game = ?",
+        (game,),
+    ).fetchall()
+    folder_to_row: dict[str, object] = {}
+    for r in rows:
+        fn = r["folder_name"] or (_archive_basename(r["filename"]) if r["filename"] else None)
+        if fn:
+            folder_to_row[fn] = r
+    profile_domain = GAMES.get(game, {}).get("domain", game)
+    mods_list: list[dict] = []
+    for folder in folders:
+        r = folder_to_row.get(folder)
+        if r is None:
+            continue  # untracked — skip; these were already warned about above
+        mods_list.append({
+            "mod_id":      r["mod_id"],
+            "name":        r["name"] or "",
+            "version":     r["version"],
+            "folder_name": folder,
+            "domain":      profile_domain,
+        })
+
+    _write_profile(game, name, folders, description, directive_lines, mods=mods_list)
     log.info("Profile '%s' saved for %s (%d mods)", name, game, len(folders))
     console.print(f"[green]✓ Profile saved:[/green] {name} ({len(folders)} mods)")
 
@@ -2904,15 +2945,26 @@ def profile_load(game, name, dry_run, do_install_missing, strict, auto_merge):
 
     if do_install_missing and missing_on_disk:
         api_key = get_api_key()
-        rows    = db.execute(
-            "SELECT mod_id, name, filename, folder_name FROM mods WHERE game = ?", (game,)
-        ).fetchall()
-        # Prefer folder_name column (written at install time); fall back to archive basename.
-        folder_to_mod_id: dict[str, int] = {}
-        for r in rows:
-            fn = r["folder_name"] or (_archive_basename(r["filename"]) if r["filename"] else None)
-            if fn:
-                folder_to_mod_id[fn] = r["mod_id"]
+        # If the profile carries a "mods" list (saved by profile_save ≥ 0.9.x),
+        # use it directly — mod_id is right there, no DB lookup needed.
+        profile_mods = p.get("mods")
+        if profile_mods:
+            folder_to_mod_id: dict[str, int] = {
+                m["folder_name"]: m["mod_id"]
+                for m in profile_mods
+                if m.get("folder_name") and m.get("mod_id") is not None
+            }
+        else:
+            # Backward compat: old profiles without "mods" key fall back to DB lookup.
+            rows = db.execute(
+                "SELECT mod_id, name, filename, folder_name FROM mods WHERE game = ?", (game,)
+            ).fetchall()
+            # Prefer folder_name column (written at install time); fall back to archive basename.
+            folder_to_mod_id = {}
+            for r in rows:
+                fn = r["folder_name"] or (_archive_basename(r["filename"]) if r["filename"] else None)
+                if fn:
+                    folder_to_mod_id[fn] = r["mod_id"]
 
         installed = 0
         skipped: list[str] = []
@@ -3087,7 +3139,8 @@ def show_logs(lines, errors, follow):
 @click.argument("game", required=False, default=None)
 @click.option("--limit", "-n", default=30, help="Number of entries (default 30)")
 @click.option("--failures", "-f", is_flag=True, help="Show only failures")
-def show_history(game, limit, failures):
+@click.option("--json", "as_json", is_flag=True, help="Emit machine-readable JSON.")
+def show_history(game, limit, failures, as_json):
     """Show install/update history."""
     db = get_db()
     q  = "SELECT * FROM history"
@@ -3105,7 +3158,14 @@ def show_history(game, limit, failures):
 
     rows = db.execute(q, p).fetchall()
     if not rows:
-        console.print("[yellow]No history records.[/yellow]")
+        if as_json:
+            click.echo("[]")
+        else:
+            console.print("[yellow]No history records.[/yellow]")
+        return
+
+    if as_json:
+        click.echo(json.dumps([dict(r) for r in rows]))
         return
 
     t = Table(title="Operation history", show_lines=False)
@@ -3170,6 +3230,29 @@ def diag(game, lines, show_all):
     console.print(f"[dim]Game log: {game_log}[/dim]")
     size_kb = game_log.stat().st_size // 1024
     console.print(f"[dim]Size: {size_kb} KB[/dim]\n")
+
+    # Darktide: check if the game bundle was updated more recently than dtkit-patch.
+    # After a Fatshark patch the bundle is reset and mods silently stop loading.
+    if game == "darktide":
+        try:
+            db = get_db()
+            _mod_dir = resolve_mod_dir(game, db)
+            _game_dir = _mod_dir.parent
+            _bundle_dir = _game_dir / "bundle"
+            _dtkit = _find_dtkit(_game_dir)
+            if _bundle_dir.exists() and _dtkit and _dtkit.exists():
+                _dtkit_mtime = _dtkit.stat().st_mtime
+                _bundle_files = list(_bundle_dir.iterdir())
+                if _bundle_files:
+                    _newest_bundle = max(f.stat().st_mtime for f in _bundle_files)
+                    if _newest_bundle > _dtkit_mtime:
+                        console.print(
+                            "[yellow]Warning:[/yellow] Game bundle files are newer than dtkit-patch — "
+                            "a game update may have reset mod support.\n"
+                            "  If mods are not loading, re-run: [cyan]nexmod enable darktide[/cyan]"
+                        )
+        except Exception:
+            pass  # never crash diag due to this optional check
 
     text      = game_log.read_text(errors="replace")
     all_lines = text.splitlines()
@@ -3293,6 +3376,14 @@ def search_mods(game, query, count, as_json):
     # Sort by endorsements descending
     nodes = sorted(nodes, key=lambda n: n.get("endorsements") or 0, reverse=True)
 
+    # Build the set of installed mod_ids for this game.
+    db = get_db()
+    installed_ids: set[int] = {
+        r[0] for r in db.execute(
+            "SELECT mod_id FROM mods WHERE game = ?", (game,)
+        ).fetchall()
+    }
+
     if as_json:
         import json as _json
         out = [
@@ -3302,6 +3393,7 @@ def search_mods(game, query, count, as_json):
                 "summary": n.get("summary", "") or "",
                 "downloads": n.get("downloads") or 0,
                 "endorsements": n.get("endorsements") or 0,
+                "installed": (n.get("modId") or 0) in installed_ids,
             }
             for n in nodes
         ]
@@ -3332,14 +3424,18 @@ def search_mods(game, query, count, as_json):
     t.add_column("Summary", no_wrap=False)
     t.add_column("DL", justify="right", style="dim")
     t.add_column("[green]✓[/green]", justify="right")
+    t.add_column("Inst.", justify="center", no_wrap=True)
 
     for n in nodes:
+        mid = n.get("modId") or 0
+        inst_mark = "[green]✓[/green]" if mid in installed_ids else ""
         t.add_row(
-            str(n.get("modId") or ""),
+            str(mid or ""),
             n.get("name") or "",
             _trunc(n.get("summary") or ""),
             _fmt_num(n.get("downloads")),
             _fmt_num(n.get("endorsements")),
+            inst_mark,
         )
 
     console.print(t)
@@ -3986,15 +4082,16 @@ def check_updates(game, output_json):
                 mod    = api_mod_info(domain, r["mod_id"], api_key)
             latest = mod.get("version", "?")
             cur    = r["version"] or "?"
+            _versions_match = _norm_version(latest) == _norm_version(cur)
             if output_json:
                 results.append({
                     "game": game, "mod_id": r["mod_id"], "name": r["name"],
                     "installed": cur, "latest": latest,
-                    "update_available": latest != cur and latest != "?",
+                    "update_available": not _versions_match and latest != "?",
                     "error": None,
                 })
             else:
-                label = "[green]Current[/green]" if latest == cur else f"[yellow]Update → {latest}[/yellow]"
+                label = "[green]Current[/green]" if _versions_match else f"[yellow]Update → {latest}[/yellow]"
                 t.add_row(r["name"], cur, latest, label)
         except Exception as e:
             log.error("Check failed for mod_id=%s: %s", r["mod_id"], e)
@@ -4734,7 +4831,7 @@ def update_mods(game, mod_id, yes, no_reorder, fix_deps, output_json):
                 json_failed.append({"mod_id": r["mod_id"], "name": r["name"], "error": str(e)})
                 continue
 
-        if latest == r["version"]:
+        if _norm_version(latest) == _norm_version(r["version"] or ""):
             if not output_json:
                 console.print(f"[dim]{r['name']}: current ({latest})[/dim]")
             json_current.append({"mod_id": r["mod_id"], "name": r["name"], "version": latest})
@@ -5445,6 +5542,18 @@ def nxm_register():
             "x-scheme-handler/nxm[/cyan]"
         )
 
+    # Flatpak Steam / Flatpak browser warning: XDG data dirs are isolated,
+    # so the browser inside Flatpak won't dispatch to the system nexmod handler.
+    flatpak_steam = Path.home() / ".var/app/com.valvesoftware.Steam"
+    if flatpak_steam.exists():
+        console.print(
+            "\n[yellow]Warning:[/yellow] Flatpak Steam detected. NXM links may not work in "
+            "Flatpak browsers because Flatpak apps have isolated XDG data dirs.\n"
+            "  If clicking NXM links does nothing, open a terminal and run:\n"
+            "    [cyan]nexmod nxm <paste-the-nxm-url>[/cyan]\n"
+            "  Or use a native (non-Flatpak) browser."
+        )
+
     console.print(
         "\n[bold]Done.[/bold] Click 'Mod Manager Download' on any Nexus mod "
         "page to test."
@@ -5508,6 +5617,9 @@ def _run_dtkit(game_dir: Path, action: str) -> tuple[bool, str]:
 @click.argument("game")
 def enable_mods(game):
     """Patch the game bundle to enable mod loading (runs dtkit-patch via Wine)."""
+    if game != "darktide":
+        console.print(f"[yellow]{game} does not use dtkit-patch — enable/disable/toggle is Darktide-only.[/yellow]")
+        sys.exit(1)
     db       = get_db()
     mod_dir  = resolve_mod_dir(game, db)
     game_dir = mod_dir.parent
@@ -5526,6 +5638,9 @@ def enable_mods(game):
 @click.argument("game")
 def disable_mods(game):
     """Unpatch the game bundle to disable mod loading."""
+    if game != "darktide":
+        console.print(f"[yellow]{game} does not use dtkit-patch — enable/disable/toggle is Darktide-only.[/yellow]")
+        sys.exit(1)
     db       = get_db()
     mod_dir  = resolve_mod_dir(game, db)
     game_dir = mod_dir.parent
@@ -5544,6 +5659,9 @@ def disable_mods(game):
 @click.argument("game")
 def toggle_mods(game):
     """Toggle mod loading on/off (patch ↔ unpatch)."""
+    if game != "darktide":
+        console.print(f"[yellow]{game} does not use dtkit-patch — enable/disable/toggle is Darktide-only.[/yellow]")
+        sys.exit(1)
     db       = get_db()
     mod_dir  = resolve_mod_dir(game, db)
     game_dir = mod_dir.parent
