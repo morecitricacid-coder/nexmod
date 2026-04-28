@@ -10,6 +10,15 @@ All notable changes to nexmod are documented here. Format follows
 
 ---
 
+## [1.0.2] — Auto update check — 2026-04-28
+
+### Added
+
+- Self-update check: nexmod queries PyPI once per 24 h and prints a one-line
+  notice when a newer version is available. Fully silent on network errors.
+
+---
+
 ## [1.0.1] — Native dtkit-patch, free-tier import, fsck scan — 2026-04-28
 
 ### Added

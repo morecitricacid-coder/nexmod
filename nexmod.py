@@ -29,7 +29,7 @@ from rich.table import Table
 from rich.progress import Progress, DownloadColumn, TransferSpeedColumn, BarColumn, TextColumn
 from rich.syntax import Syntax
 
-__version__ = "1.0.1"
+__version__ = "1.0.2"
 
 console = Console()
 log = logging.getLogger("nexmod")
@@ -6217,6 +6217,39 @@ def mcp_server():
         )
         sys.exit(1)
     _mcp_main()
+
+
+_UPDATE_CHECK_FILE = CACHE_DIR / ".update_check"
+_UPDATE_CHECK_INTERVAL = 86400  # 24 hours
+
+
+def _check_self_update() -> None:
+    """Print a notice if a newer nexmod version is available on PyPI (once per 24h)."""
+    try:
+        now = time.time()
+        if _UPDATE_CHECK_FILE.exists():
+            if now - _UPDATE_CHECK_FILE.stat().st_mtime < _UPDATE_CHECK_INTERVAL:
+                return
+        import urllib.request
+        with urllib.request.urlopen(
+            "https://pypi.org/pypi/nexmod/json", timeout=2
+        ) as resp:
+            data = json.loads(resp.read())
+        latest = data["info"]["version"]
+        _UPDATE_CHECK_FILE.parent.mkdir(parents=True, exist_ok=True)
+        _UPDATE_CHECK_FILE.touch()
+        if _norm_version(latest) != _norm_version(__version__):
+            console.print(
+                f"\n[dim]nexmod {latest} available — "
+                f"pip install --upgrade nexmod[/dim]"
+            )
+    except Exception:
+        pass
+
+
+@cli.result_callback()
+def _post_command(*args, **kwargs):
+    _check_self_update()
 
 
 if __name__ == "__main__":
