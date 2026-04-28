@@ -18,7 +18,7 @@ import nexmod as _nm
 
 mcp = FastMCP(
     "nexmod",
-    description=(
+    instructions=(
         "Linux-native Nexus Mods mod manager. Install, update, search, and manage "
         "mod profiles for Darktide, Skyrim, BG3, Cyberpunk 2077, Fallout 4, and Starfield."
     ),

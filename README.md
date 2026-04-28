@@ -639,7 +639,9 @@ If your game is on Nexus Mods and runs on Linux, it can probably be added in a f
 
 ### Integrating nexmod with other tools
 
-**As a library** — nexmod is intentionally a single-file CLI, not a Python library. Call it as a subprocess rather than importing it. The `--json` flags give you structured output, and the SQLite DB at `~/.local/share/nexmod/mods.db` is WAL-mode safe to read concurrently.
+**As a library** — nexmod is MIT-licensed and importable as a Python module. You can `import nexmod` and call its internal functions directly to build your own MCP server, automation, or integration on top of it. The `--json` flags and the SQLite DB at `~/.local/share/nexmod/mods.db` (WAL-mode, safe to read concurrently) are the stable external interfaces; internal functions may change between releases.
+
+**Build your own MCP server** — the bundled `nexmod_mcp.py` is a reference implementation. Fork it, add or remove tools, wrap it in your own FastMCP instance. Because nexmod is a plain importable module, your MCP server can call `_nm.do_install()`, `_nm.api_search_mods()`, `_nm.get_db()` directly — no subprocess overhead, full access to all internal state.
 
 **From an LLM agent** — see the [For Automation / LLMs](#for-automation--llms) section above for the full JSON contract. Primary read paths: `nexmod search --json`, `nexmod list --json`, `nexmod check --json`. Primary write paths: `nexmod install`, `nexmod update --yes --json`. The DB is always safe to query directly for read-only access.
 
