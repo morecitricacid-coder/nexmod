@@ -41,7 +41,8 @@ def test_setup_steam_found_registers_game(tmp_path, monkeypatch):
     result = runner.invoke(
         cli,
         ["setup", "--game", "darktide"],
-        input="TESTKEY1234\ny\n",  # API key + confirm "Manage it with nexmod?"
+        # API key + confirm "Manage it with nexmod?" + decline dtkit download
+        input="TESTKEY1234\ny\nn\n",
         catch_exceptions=False,
     )
 

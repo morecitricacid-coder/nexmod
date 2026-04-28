@@ -92,20 +92,19 @@ def _make_zip(path: Path, members: dict):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# A. Enable / disable / toggle  (dtkit-patch via Wine)
+# A. Enable / disable / toggle  (dtkit-patch — native Linux binary preferred)
 # ─────────────────────────────────────────────────────────────────────────────
 
 class TestEnable:
 
-    def test_enable_no_wine_fails_gracefully(self, runner, darktide_mod_dir):
-        """enable with Wine missing reports failure without crashing."""
-        with patch("nexmod.shutil.which", return_value=None), \
-             patch("nexmod._find_dtkit", return_value=None):
+    def test_enable_no_dtkit_reports_failure(self, runner, darktide_mod_dir):
+        """enable with no dtkit binary present reports failure without crashing."""
+        with patch("nexmod._find_dtkit", return_value=None):
             result = runner.invoke(cli, ["enable", "darktide"])
         assert result.exit_code == 0        # command itself exits 0
-        # The output should say it failed — dtkit or wine missing
+        # The output should say it failed — dtkit missing
         assert any(word in result.output.lower()
-                   for word in ("wine", "failed", "not found", "✗"))
+                   for word in ("dtkit", "failed", "not found", "✗"))
 
     def test_enable_no_dtkit_fails_gracefully(self, runner, darktide_mod_dir):
         """enable when dtkit-patch.exe absent shows clear error."""
@@ -158,12 +157,11 @@ class TestDisable:
         assert result.exit_code == 0
         assert "disabled" in result.output.lower() or "✓" in result.output
 
-    def test_disable_no_wine(self, runner, darktide_mod_dir):
-        with patch("nexmod.shutil.which", return_value=None), \
-             patch("nexmod._find_dtkit", return_value=None):
+    def test_disable_no_dtkit(self, runner, darktide_mod_dir):
+        with patch("nexmod._find_dtkit", return_value=None):
             result = runner.invoke(cli, ["disable", "darktide"])
         assert result.exit_code == 0
-        assert any(w in result.output.lower() for w in ("wine", "failed", "not found", "✗"))
+        assert any(w in result.output.lower() for w in ("dtkit", "failed", "not found", "✗"))
 
     def test_disable_cleans_up_on_success(self, runner, darktide_mod_dir):
         """disable success path logs and prints success — doesn't hang."""
@@ -198,12 +196,11 @@ class TestToggle:
         assert result.exit_code == 0
         assert "✗" in result.output or "failed" in result.output.lower()
 
-    def test_toggle_no_wine(self, runner, darktide_mod_dir):
-        with patch("nexmod.shutil.which", return_value=None), \
-             patch("nexmod._find_dtkit", return_value=None):
+    def test_toggle_no_dtkit(self, runner, darktide_mod_dir):
+        with patch("nexmod._find_dtkit", return_value=None):
             result = runner.invoke(cli, ["toggle", "darktide"])
         assert result.exit_code == 0
-        assert any(w in result.output.lower() for w in ("wine", "not found", "✗", "failed"))
+        assert any(w in result.output.lower() for w in ("dtkit", "not found", "✗", "failed"))
 
 
 class TestFindDtkit:
@@ -228,47 +225,155 @@ class TestFindDtkit:
         assert nexmod._find_dtkit(tmp_path) is None
 
 
+class TestFindDtkitPriority:
+    """Verify that native Linux binary is preferred over .exe."""
+
+    def test_native_preferred_over_exe(self, tmp_path):
+        """When both binaries exist, native Linux binary wins."""
+        tools = tmp_path / "tools"
+        tools.mkdir()
+        native = tools / "dtkit-patch"
+        exe    = tools / "dtkit-patch.exe"
+        native.write_bytes(b"native")
+        exe.write_bytes(b"win")
+        found = nexmod._find_dtkit(tmp_path)
+        assert found == native
+        assert found.suffix != ".exe"
+
+    def test_exe_fallback_when_no_native(self, tmp_path):
+        """Falls back to .exe when native binary is absent."""
+        tools = tmp_path / "tools"
+        tools.mkdir()
+        (tools / "dtkit-patch.exe").write_bytes(b"win")
+        found = nexmod._find_dtkit(tmp_path)
+        assert found is not None
+        assert found.suffix == ".exe"
+
+
 class TestRunDtkit:
 
-    def test_run_dtkit_no_wine(self, tmp_path):
-        with patch("nexmod.shutil.which", return_value=None):
-            ok, msg = nexmod._run_dtkit(tmp_path, "--patch")
-        assert not ok
-        assert "wine" in msg.lower()
-
-    def test_run_dtkit_no_dtkit_exe(self, tmp_path):
+    def test_run_dtkit_no_dtkit_at_all(self, tmp_path):
+        """_run_dtkit fails with dtkit-not-found message when no binary exists."""
         (tmp_path / "tools").mkdir()
-        with patch("nexmod.shutil.which", return_value="/usr/bin/wine"):
-            ok, msg = nexmod._run_dtkit(tmp_path, "--patch")
+        ok, msg = nexmod._run_dtkit(tmp_path, "--patch")
         assert not ok
         assert "dtkit-patch" in msg.lower()
 
-    def test_run_dtkit_success(self, tmp_path):
+    def test_run_dtkit_exe_no_wine_fails(self, tmp_path):
+        """_run_dtkit with .exe but no Wine gives a clear message."""
+        tools = tmp_path / "tools"
+        tools.mkdir()
+        (tools / "dtkit-patch.exe").write_bytes(b"x")
+        with patch("nexmod.shutil.which", return_value=None):
+            ok, msg = nexmod._run_dtkit(tmp_path, "--patch")
+        assert not ok
+        assert "wine" in msg.lower() or "dtkit-patch.exe" in msg.lower()
+
+    def test_run_dtkit_native_success(self, tmp_path):
+        """_run_dtkit with native binary runs directly (no Wine)."""
+        tools = tmp_path / "tools"
+        tools.mkdir()
+        (tools / "dtkit-patch").write_bytes(b"x")
+        fake_result = MagicMock(returncode=0, stdout="patched\n", stderr="")
+        with patch("nexmod.subprocess.run", return_value=fake_result) as mock_run:
+            ok, msg = nexmod._run_dtkit(tmp_path, "--patch")
+        assert ok
+        assert "patched" in msg
+        # Wine must NOT appear in the command for native binary
+        cmd = mock_run.call_args[0][0]
+        assert "wine" not in cmd
+
+    def test_run_dtkit_exe_success_via_wine(self, tmp_path):
+        """_run_dtkit with .exe invokes Wine."""
         tools = tmp_path / "tools"
         tools.mkdir()
         (tools / "dtkit-patch.exe").write_bytes(b"x")
         fake_result = MagicMock(returncode=0, stdout="patched\n", stderr="")
         with patch("nexmod.shutil.which", return_value="/usr/bin/wine"), \
-             patch("nexmod.subprocess.run", return_value=fake_result):
+             patch("nexmod.subprocess.run", return_value=fake_result) as mock_run:
             ok, msg = nexmod._run_dtkit(tmp_path, "--patch")
         assert ok
-        assert "patched" in msg
+        cmd = mock_run.call_args[0][0]
+        assert "wine" in cmd
 
     def test_run_dtkit_filters_radv_noise(self, tmp_path):
+        """radv GPU noise is filtered from output."""
         tools = tmp_path / "tools"
         tools.mkdir()
-        (tools / "dtkit-patch.exe").write_bytes(b"x")
+        (tools / "dtkit-patch").write_bytes(b"x")
         fake_result = MagicMock(
             returncode=0,
             stdout="radv: noisy gpu line\npatched ok\n",
             stderr="",
         )
-        with patch("nexmod.shutil.which", return_value="/usr/bin/wine"), \
-             patch("nexmod.subprocess.run", return_value=fake_result):
+        with patch("nexmod.subprocess.run", return_value=fake_result):
             ok, msg = nexmod._run_dtkit(tmp_path, "--patch")
         assert ok
         assert "radv" not in msg
         assert "patched ok" in msg
+
+    def test_run_dtkit_native_bundle_path_no_z_prefix(self, tmp_path):
+        """Native binary gets real bundle path, not Z: Wine drive prefix."""
+        tools = tmp_path / "tools"
+        tools.mkdir()
+        (tools / "dtkit-patch").write_bytes(b"x")
+        fake_result = MagicMock(returncode=0, stdout="ok\n", stderr="")
+        with patch("nexmod.subprocess.run", return_value=fake_result) as mock_run:
+            nexmod._run_dtkit(tmp_path, "--patch")
+        cmd = mock_run.call_args[0][0]
+        # bundle arg must be a real path, not a Z: Wine path
+        bundle_arg = cmd[-1]
+        assert not bundle_arg.startswith("Z:")
+        assert str(tmp_path) in bundle_arg
+
+
+class TestDownloadDtkit:
+    """_download_dtkit: tarball fetch → extract → chmod +x."""
+
+    def _make_fake_tarball(self, tmp_path, member_name="dtkit-patch"):
+        """Build a minimal .tar.gz in memory with a fake binary member."""
+        import io
+        import tarfile as tf_mod
+        buf = io.BytesIO()
+        with tf_mod.open(fileobj=buf, mode="w:gz") as tf:
+            data = b"fake binary"
+            info = tf_mod.TarInfo(name=member_name)
+            info.size = len(data)
+            tf.addfile(info, io.BytesIO(data))
+        return buf.getvalue()
+
+    def test_download_dtkit_success(self, tmp_path):
+        """Happy path: tarball downloaded, binary extracted and marked +x."""
+        import responses as resp
+        tarball = self._make_fake_tarball(tmp_path)
+        with resp.RequestsMock() as rsps:
+            rsps.add(resp.GET, nexmod._DTKIT_NATIVE_URL,
+                     body=tarball, status=200,
+                     content_type="application/gzip")
+            result = nexmod._download_dtkit(tmp_path)
+        assert result.exists()
+        assert result.name == "dtkit-patch"
+        assert result.stat().st_mode & 0o111, "binary should be executable"
+
+    def test_download_dtkit_network_error_raises(self, tmp_path):
+        """Network failure raises RuntimeError."""
+        import responses as resp
+        with resp.RequestsMock() as rsps:
+            rsps.add(resp.GET, nexmod._DTKIT_NATIVE_URL, status=500)
+            with pytest.raises(RuntimeError, match="download"):
+                nexmod._download_dtkit(tmp_path)
+
+    def test_download_dtkit_creates_tools_dir(self, tmp_path):
+        """tools/ dir is created if it doesn't exist."""
+        import responses as resp
+        tarball = self._make_fake_tarball(tmp_path)
+        assert not (tmp_path / "tools").exists()
+        with resp.RequestsMock() as rsps:
+            rsps.add(resp.GET, nexmod._DTKIT_NATIVE_URL,
+                     body=tarball, status=200,
+                     content_type="application/gzip")
+            nexmod._download_dtkit(tmp_path)
+        assert (tmp_path / "tools" / "dtkit-patch").exists()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1146,9 +1251,9 @@ class TestDoctor:
         # wine check should appear, marked as warning (!)
         assert "wine" in result.output.lower()
 
-    def test_doctor_darktide_found_checks_wine(
+    def test_doctor_darktide_found_checks_dtkit(
             self, runner, api_key_config, monkeypatch, tmp_path):
-        """doctor checks wine when Darktide install is found."""
+        """doctor checks dtkit-patch availability when Darktide install is found."""
         game_root = tmp_path / "darktide"
         (game_root / "mods").mkdir(parents=True)
         monkeypatch.setattr(nexmod, "nexus_get",
@@ -1157,7 +1262,8 @@ class TestDoctor:
              patch("nexmod.find_game_install", return_value=game_root), \
              patch("nexmod.shutil.which", return_value=None):
             result = runner.invoke(cli, ["doctor"])
-        assert "wine" in result.output.lower()
+        # dtkit-patch is not present — doctor should report it (native or wine .exe)
+        assert "dtkit" in result.output.lower() or "darktide" in result.output.lower()
         assert "darktide" in result.output.lower()
 
     def test_doctor_all_pass_prints_hint(self, runner, api_key_config, monkeypatch):
@@ -1289,8 +1395,10 @@ class TestSetup:
         monkeypatch.setattr(nexmod, "find_game_install",
                             lambda sid: game_root if sid == 1361210 else None)
         monkeypatch.setattr(nexmod.doctor, "callback", lambda game=None: None)
+        # setup now prompts about dtkit-patch download when it's missing;
+        # answer "n" to skip the download so the test doesn't hit the network.
         result = runner.invoke(cli, ["setup", "--game", "darktide"],
-                               input="TESTKEY\ny\n")
+                               input="TESTKEY\ny\nn\n")
         assert result.exit_code == 0
         db = nexmod.get_db()
         row = db.execute("SELECT path FROM game_paths WHERE game='darktide'").fetchone()

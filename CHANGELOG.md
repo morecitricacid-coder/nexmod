@@ -8,6 +8,44 @@ All notable changes to nexmod are documented here. Format follows
 
 ## [Unreleased]
 
+### Added
+- **`nexmod import <game> <path>`** — free-tier workflow for installing a locally-downloaded
+  archive. Parses the Nexus filename convention (`<Name>-<mod_id>-<file_id>-<ver>.zip`) to
+  auto-detect the mod ID; prompts to confirm or enter manually. Fetches metadata from the
+  free Nexus API, extracts, records in DB, saves a rollback snapshot, and reconciles
+  Darktide load order. Supports `--mod-id N`, `-y/--yes`, `--no-reorder`.
+- **`nexmod fsck --scan`** — detect untracked subdirectories in the game's mod folder.
+  For each unknown folder, searches Nexus (free v2 GraphQL endpoint) for possible matches,
+  shows results in a numbered table, and offers to track by selecting a result or entering
+  a mod ID directly. Skipping and tracking are both non-destructive. Reports summary at end.
+- **`_download_dtkit`** helper — downloads the native Linux static `dtkit-patch` binary from
+  the official GitHub release (`ManShanko/dtkit-patch`) and places it in
+  `<game_dir>/tools/dtkit-patch` with `0o755` permissions. Called automatically by
+  `nexmod setup` for Darktide.
+
+### Changed
+- **`nexmod enable` / `disable` / `toggle`** no longer require Wine. `_run_dtkit` now
+  detects whether the binary in `<game_dir>/tools/` is native (no `.exe` extension) or a
+  Windows binary (`.exe`). Native binary is invoked directly with the real bundle path;
+  `.exe` falls back to Wine with the `Z:` path prefix as before.
+- `_find_dtkit` now prefers the native Linux binary over `dtkit-patch.exe` when both are
+  present in the `tools/` directory.
+- `nexmod setup --game darktide` now offers to download the native `dtkit-patch` binary
+  automatically after registering the game path. Skips gracefully when declined.
+- `nexmod doctor` Darktide check now reports dtkit-patch status (native / Wine .exe /
+  missing) instead of a generic Wine availability check.
+- `nexmod install darktide` dry-run and pre-check now warn about missing `dtkit-patch`
+  rather than missing Wine.
+- `nexmod nxm` now catches the "no download URLs / Premium required" error from `do_install`
+  and opens the mod's Nexus files page (`?tab=files`) in the system browser, then prints
+  the `nexmod import <game> <path>` next-step instruction. Non-Premium-related errors still
+  propagate normally.
+
+### Fixed
+- Wine was a hard requirement for Darktide `enable`/`disable`/`toggle`; it is now an
+  optional fallback used only when the legacy `dtkit-patch.exe` is present and no native
+  binary exists.
+
 ---
 
 ## [1.0.0] — First stable release — 2026-04-28

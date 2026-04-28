@@ -4,8 +4,10 @@ Tests for migration framework, infer_folder_name, and the `nexmod fsck` command.
 import json
 import sqlite3
 import pytest
+import responses as resp_lib
 from pathlib import Path
 from click.testing import CliRunner
+from unittest.mock import patch
 import nexmod
 from nexmod import cli
 
@@ -234,3 +236,122 @@ def test_fsck_filters_by_game(tmp_path, runner):
     result = runner.invoke(cli, ["fsck", "darktide"])
     assert result.exit_code == 0
     assert "scanned 1 mod" in result.output
+
+
+# ── fsck --scan ───────────────────────────────────────────────────────────────
+
+def _setup_scan_env(tmp_path):
+    """Register darktide mod dir and write API key."""
+    mod_dir = tmp_path / "darktide" / "mods"
+    mod_dir.mkdir(parents=True)
+    db = nexmod.get_db()
+    db.execute(
+        "INSERT OR REPLACE INTO game_paths (game, path) VALUES (?, ?)",
+        ("darktide", str(mod_dir)),
+    )
+    db.commit()
+    nexmod.CONFIG_FILE.write_text(json.dumps({"api_key": "FAKEKEY000"}))
+    return mod_dir
+
+
+def test_fsck_scan_no_untracked_folders(tmp_path, runner):
+    """--scan with no untracked folders reports all-clear."""
+    mod_dir = _setup_scan_env(tmp_path)
+    # Create a folder and track it
+    (mod_dir / "TrackedMod").mkdir()
+    db = nexmod.get_db()
+    db.execute("""
+        INSERT INTO mods (game, mod_id, file_id, name, version, filename,
+                          mod_dir, folder_name, tracked_at, updated_at)
+        VALUES ('darktide', 1, 1, 'Tracked', '1.0', 'f.zip', ?, 'TrackedMod', ?, ?)
+    """, (str(mod_dir), nexmod.now_iso(), nexmod.now_iso()))
+    db.commit()
+
+    result = runner.invoke(cli, ["fsck", "darktide", "--scan"])
+    assert result.exit_code == 0
+    assert "no untracked" in result.output.lower() or "0 untracked" in result.output.lower() \
+           or "✓" in result.output
+
+
+def test_fsck_scan_requires_game_argument(runner):
+    """--scan without a GAME argument prints an error."""
+    nexmod.CONFIG_FILE.write_text(json.dumps({"api_key": "FAKEKEY000"}))
+    result = runner.invoke(cli, ["fsck", "--scan"])
+    assert result.exit_code == 0
+    assert "game" in result.output.lower() or "requires" in result.output.lower()
+
+
+@resp_lib.activate
+def test_fsck_scan_skip_unknown_folder(tmp_path, runner):
+    """--scan with an untracked folder; user skips it."""
+    mod_dir = _setup_scan_env(tmp_path)
+    (mod_dir / "UnknownMod").mkdir()
+
+    # GraphQL search returns empty
+    resp_lib.add(
+        resp_lib.POST,
+        "https://api.nexusmods.com/v2/graphql",
+        json={"data": {"mods": {"totalCount": 0, "nodes": []}}},
+        status=200,
+    )
+
+    result = runner.invoke(cli, ["fsck", "darktide", "--scan"], input="s\n")
+    assert result.exit_code == 0
+    assert "skipped" in result.output.lower() or "1 skipped" in result.output.lower()
+
+    # DB should still be empty
+    db = nexmod.get_db()
+    count = db.execute("SELECT COUNT(*) FROM mods WHERE game='darktide'").fetchone()[0]
+    assert count == 0
+
+
+@resp_lib.activate
+def test_fsck_scan_track_by_mod_id(tmp_path, runner):
+    """--scan with an untracked folder; user enters a mod ID to track it."""
+    mod_dir = _setup_scan_env(tmp_path)
+    (mod_dir / "CoolMod").mkdir()
+    api = nexmod.NEXUS_API
+    domain = "warhammer40kdarktide"
+
+    # GraphQL search returns one match
+    resp_lib.add(
+        resp_lib.POST,
+        "https://api.nexusmods.com/v2/graphql",
+        json={"data": {"mods": {"totalCount": 1, "nodes": [
+            {"modId": 42, "name": "CoolMod", "summary": "", "downloads": 100, "endorsements": 50}
+        ]}}},
+        status=200,
+    )
+    # mod info + files
+    resp_lib.add(resp_lib.GET, f"{api}/games/{domain}/mods/42.json",
+                 json={"name": "CoolMod", "version": "1.0", "author": "x"})
+    resp_lib.add(resp_lib.GET, f"{api}/games/{domain}/mods/42/files.json",
+                 json={"files": [{"file_id": 99, "file_name": "CoolMod.zip",
+                                  "category_name": "MAIN", "size_kb": 10,
+                                  "uploaded_timestamp": 1}]})
+
+    # User picks option "1" from the list
+    result = runner.invoke(cli, ["fsck", "darktide", "--scan"], input="1\n")
+    assert result.exit_code == 0
+
+    db = nexmod.get_db()
+    row = db.execute(
+        "SELECT * FROM mods WHERE game='darktide' AND mod_id=42"
+    ).fetchone()
+    assert row is not None
+    assert row["folder_name"] == "CoolMod"
+
+
+def test_fsck_scan_mod_dir_missing(tmp_path, runner):
+    """--scan reports clearly when mod directory does not exist."""
+    nexmod.CONFIG_FILE.write_text(json.dumps({"api_key": "FAKEKEY000"}))
+    # Register a path that doesn't exist
+    db = nexmod.get_db()
+    db.execute(
+        "INSERT OR REPLACE INTO game_paths (game, path) VALUES (?, ?)",
+        ("darktide", str(tmp_path / "nonexistent")),
+    )
+    db.commit()
+    result = runner.invoke(cli, ["fsck", "darktide", "--scan"])
+    assert result.exit_code == 0
+    assert "does not exist" in result.output.lower() or "not exist" in result.output.lower()

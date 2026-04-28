@@ -5,6 +5,7 @@ import click
 import requests
 import sqlite3
 import json
+import io
 import os
 import struct
 import subprocess
@@ -19,6 +20,7 @@ import fcntl
 import tempfile
 import time
 import difflib
+import webbrowser
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from datetime import datetime, timezone
@@ -3500,6 +3502,31 @@ def setup_wizard(ctx, game, reset):
                 )
                 db.commit()
                 console.print(f"  [green]✓[/green] Registered: {slug} → {mod_path}")
+                # Darktide: offer to download dtkit-patch native binary
+                if slug == "darktide":
+                    existing = _find_dtkit(game_path)
+                    if existing and existing.suffix != ".exe":
+                        console.print(f"  [green]✓[/green] dtkit-patch (native) already present.")
+                    elif existing:
+                        console.print(
+                            f"  [yellow]dtkit-patch.exe found — native Linux binary preferred.[/yellow]"
+                        )
+                        if click.confirm("  Download native Linux binary now?", default=True):
+                            try:
+                                _download_dtkit(game_path)
+                            except RuntimeError as e:
+                                console.print(f"  [red]Download failed:[/red] {e}")
+                    else:
+                        console.print("  dtkit-patch not found (needed for enable/disable).")
+                        if click.confirm("  Download native Linux binary now?", default=True):
+                            try:
+                                _download_dtkit(game_path)
+                            except RuntimeError as e:
+                                console.print(f"  [red]Download failed:[/red] {e}")
+                        else:
+                            console.print(
+                                "  [dim]Skipped. Run later: nexmod setup --game darktide[/dim]"
+                            )
             else:
                 console.print(f"  [dim]Skipped {slug}.[/dim]")
         else:
@@ -3524,6 +3551,15 @@ def setup_wizard(ctx, game, reset):
             )
             db.commit()
             console.print(f"  [green]✓[/green] Registered: {slug} → {path}")
+            # Darktide: offer dtkit download for manually-entered paths too
+            if slug == "darktide":
+                existing = _find_dtkit(path.parent)
+                if not (existing and existing.suffix != ".exe"):
+                    if click.confirm("  Download native dtkit-patch binary now?", default=True):
+                        try:
+                            _download_dtkit(path.parent)
+                        except RuntimeError as e:
+                            console.print(f"  [red]Download failed:[/red] {e}")
 
     # ── Doctor check ──────────────────────────────────────────────────────────
     console.print()
@@ -3539,7 +3575,7 @@ def doctor(game):
     """Pre-flight environment check.
 
     Verifies the things that cause cryptic errors later: API key + Premium
-    status, Steam library detection, per-game install paths, Wine + 7z
+    status, Steam library detection, per-game install paths, dtkit-patch + 7z
     binaries, disk space, and config/data directory writability.
 
     Exit code 0 when everything is OK, 1 when at least one check fails.
@@ -3599,9 +3635,6 @@ def doctor(game):
 
     # ── External binaries ────────────────────────────────────────────────────
     console.print("\n[bold]External tools[/bold]")
-    has_wine = bool(shutil.which("wine"))
-    status("wine (for Darktide enable/disable)", has_wine,
-           "" if has_wine else "needed only for dtkit-patch", warn=not has_wine)
     has_7z = bool(shutil.which("7z") or shutil.which("7zz") or shutil.which("7za"))
     status("7z (for .7z archives)", has_7z,
            "" if has_7z else "install p7zip-full", warn=not has_7z)
@@ -3629,10 +3662,21 @@ def doctor(game):
             status(f"{slug}: mod dir exists", mod_subdir.exists(),
                    str(mod_subdir),
                    warn=not mod_subdir.exists())
-            # Darktide: check Wine (needed for dtkit-patch)
-            if slug == "darktide" and not shutil.which("wine"):
-                status(f"{slug}: wine available", False,
-                       "needed for nexmod enable/disable", warn=True)
+            # Darktide: check for dtkit-patch (native preferred; Wine .exe fallback)
+            if slug == "darktide":
+                _dtkit_check = _find_dtkit(path)
+                if _dtkit_check and _dtkit_check.suffix != ".exe":
+                    status(f"{slug}: dtkit-patch (native)", True, str(_dtkit_check))
+                elif _dtkit_check:
+                    has_wine = bool(shutil.which("wine"))
+                    status(f"{slug}: dtkit-patch (Wine .exe)", has_wine,
+                           str(_dtkit_check) if has_wine else
+                           "replace with native binary — run: nexmod setup --game darktide",
+                           warn=not has_wine)
+                else:
+                    status(f"{slug}: dtkit-patch", False,
+                           "run: nexmod setup --game darktide  to auto-download",
+                           warn=True)
             # Starfield: check SFSE + Plugins.txt
             if slug == "starfield":
                 sfse_loader = path / "sfse_loader.exe"
@@ -3824,17 +3868,25 @@ def install(game, mod_id, file_id, no_reorder, dry_run, from_file):
         console.print(f"  File:       {chosen['file_name']} ({chosen.get('size_kb', '?')} KB, "
                       f"category={chosen.get('category_name')})")
         console.print(f"  Target dir: {target_dir}")
-        # Wine warning for Darktide installs (needed for enable/disable later)
-        if game == "darktide" and not shutil.which("wine"):
-            console.print("  [yellow]⚠ wine not found — install it now to use enable/disable later.[/yellow]")
+        # Darktide: warn if dtkit-patch is missing (needed for enable/disable)
+        if game == "darktide":
+            _dtkit_hint = _find_dtkit(resolve_mod_dir(game, db).parent)
+            if not _dtkit_hint:
+                console.print(
+                    "  [yellow]⚠ dtkit-patch not found — run: nexmod setup --game darktide "
+                    "to download it (needed for enable/disable later).[/yellow]"
+                )
         return
 
-    # Wine pre-check for Darktide installs (warn only, install proceeds)
-    if game == "darktide" and not shutil.which("wine"):
-        console.print(
-            "[yellow]⚠ wine is not installed.[/yellow] Mods will install fine, but "
-            "you'll need wine to run [cyan]nexmod enable darktide[/cyan]."
-        )
+    # Darktide: hint if dtkit-patch is absent (install proceeds regardless)
+    if game == "darktide":
+        _dtkit_hint = _find_dtkit(resolve_mod_dir(game, db).parent)
+        if not _dtkit_hint:
+            console.print(
+                "[yellow]⚠ dtkit-patch not found.[/yellow] Mods will install fine, but "
+                "you'll need it to run [cyan]nexmod enable darktide[/cyan]. "
+                "Download it with: [cyan]nexmod setup --game darktide[/cyan]"
+            )
 
     name, version = do_install(game, mod_id, file_id, api_key, db, from_file=from_file)
     console.print(f"\n[green]✓ Installed:[/green] {name} v{version}")
@@ -3902,6 +3954,230 @@ def track(game, mod_id):
     db.commit()
     record(db, "track", game, mod_id, mod["name"], mod.get("version"), "ok")
     console.print(f"[green]Tracking:[/green] {mod['name']} v{mod.get('version', '?')}")
+
+
+# import ──────────────────────────────────────────────────────────────────────
+
+def _parse_nexus_filename(filename: str) -> tuple[int | None, int | None]:
+    """Try to extract (mod_id, file_id) from a Nexus Mods archive filename.
+
+    Nexus uses: <ModName>-<mod_id>-<file_id>-<version>.<ext>
+    e.g. "CoolMod-1234-5678-1-2-3.zip" → mod_id=1234, file_id=5678
+
+    Strategy: split the stem on "-", find the first two purely-numeric segments.
+    These are the mod_id and file_id. The leading name portion and trailing
+    version portion may also contain digits, but version segments are never the
+    first numeric segment encountered after the name.
+
+    Returns (mod_id, file_id) as ints if at least two numeric segments are found,
+    (None, None) otherwise.
+    """
+    stem = os.path.splitext(filename)[0]
+    parts = stem.split("-")
+    digit_parts = [p for p in parts if p.isdigit()]
+    if len(digit_parts) >= 2:
+        return int(digit_parts[0]), int(digit_parts[1])
+    return None, None
+
+
+@cli.command("import")
+@click.argument("game")
+@click.argument("path", type=click.Path(exists=True, dir_okay=False, readable=True))
+@click.option("--mod-id", "mod_id_opt", type=int, default=None,
+              help="Nexus mod ID (skip detection prompt).")
+@click.option("--yes", "-y", is_flag=True,
+              help="Accept auto-detected mod ID without prompting.")
+@click.option("--no-reorder", is_flag=True,
+              help="Skip automatic load order reconcile after install.")
+def import_archive(game, path, mod_id_opt, yes, no_reorder):
+    """Install a locally-downloaded archive (free-tier workflow).
+
+    \b
+    Free Nexus users cannot use the API download endpoint. Download the archive
+    manually from nexusmods.com, then run:
+
+      nexmod import darktide /path/to/ModName-1234-1-2-3.zip
+
+    nexmod will try to detect the mod ID from the filename, fetch metadata from
+    the Nexus API (free, no Premium required), extract the archive, and register
+    the mod in the local database.
+    """
+    archive = Path(path).resolve()
+    api_key = get_api_key()
+    db      = get_db()
+    info    = GAMES.get(game)
+    domain  = info["domain"] if info else game
+
+    # ── Determine mod_id ─────────────────────────────────────────────────────
+    if mod_id_opt is not None:
+        mod_id = mod_id_opt
+        console.print(f"  Using provided mod ID: [cyan]{mod_id}[/cyan]")
+    else:
+        detected_id, detected_file_id = _parse_nexus_filename(archive.name)
+        if detected_id is not None:
+            if yes or click.confirm(
+                f"  Detected mod ID [cyan]{detected_id}[/cyan] from filename — is that right?",
+                default=True,
+            ):
+                mod_id = detected_id
+            else:
+                mod_id = click.prompt("  Enter the Nexus mod ID for this file", type=int)
+        else:
+            console.print(
+                f"  [yellow]Could not detect mod ID from filename:[/yellow] [dim]{archive.name}[/dim]"
+            )
+            mod_id = click.prompt("  Enter the Nexus mod ID for this file", type=int)
+
+    console.print(
+        f"[bold]Importing:[/bold] [dim]{archive.name}[/dim] → [cyan]{game}[/cyan] mod [cyan]{mod_id}[/cyan]"
+    )
+
+    # ── Fetch mod metadata (free endpoint) ───────────────────────────────────
+    with console.status(f"Fetching mod {mod_id} info from Nexus..."):
+        try:
+            mod = api_mod_info(domain, mod_id, api_key)
+        except SystemExit:
+            console.print(f"[red]Could not fetch mod info for mod {mod_id}.[/red]")
+            sys.exit(1)
+
+    console.print(
+        f"  [bold]{mod['name']}[/bold] by {mod.get('author', '?')} — v{mod.get('version', '?')}"
+    )
+
+    # ── Fetch file list to get file_id ────────────────────────────────────────
+    # If we detected a file_id from the filename, prefer it; otherwise pick the
+    # main file from the API list for the file_id record.
+    detected_id, detected_file_id = _parse_nexus_filename(archive.name)
+    file_id_for_db = detected_file_id
+
+    with console.status("Fetching file list..."):
+        try:
+            files = api_mod_files(domain, mod_id, api_key)
+        except SystemExit:
+            files = []
+
+    if file_id_for_db is None and files:
+        chosen_file = pick_main_file(files)
+        file_id_for_db = chosen_file["file_id"] if chosen_file else 0
+    elif file_id_for_db is None:
+        file_id_for_db = 0
+
+    # ── Extract archive ───────────────────────────────────────────────────────
+    mod_dir = resolve_mod_dir(game, db)
+    mod_dir.mkdir(parents=True, exist_ok=True)
+
+    size_bytes = archive.stat().st_size
+    try:
+        if mod_dir.exists():
+            _check_disk_space(mod_dir, size_bytes * 3, "extraction")
+    except RuntimeError as e:
+        record(db, "install", game, mod_id, mod["name"], mod.get("version"), "fail", str(e))
+        console.print(f"[red]{e}[/red]")
+        sys.exit(1)
+
+    dirs_before = {p.name for p in mod_dir.iterdir() if p.is_dir()} if mod_dir.exists() else set()
+    plugin_exts = (info or {}).get("plugin_exts", ())
+    plugins_before = _get_disk_plugins(mod_dir, plugin_exts) if (mod_dir.exists() and plugin_exts) else set()
+
+    top_dirs = _archive_top_level_dirs(archive)
+    conflicts = _detect_install_conflicts(db, game, mod_id, top_dirs)
+    if conflicts:
+        console.print(
+            f"\n[yellow]⚠ Archive contains folders already claimed by other tracked mods:[/yellow]"
+        )
+        for folder, other_name, other_id in conflicts:
+            console.print(
+                f"  [yellow]{folder}/[/yellow] is owned by [cyan]{other_name}[/cyan] (mod {other_id})"
+            )
+        console.print("  Continuing will overwrite those mods' files.")
+        if not click.confirm("Continue?", default=False):
+            console.print("[dim]Aborted.[/dim]")
+            sys.exit(0)
+
+    console.print(f"  Extracting to [dim]{mod_dir}[/dim]...")
+    try:
+        extract_archive(archive, mod_dir)
+    except Exception as e:
+        record(db, "install", game, mod_id, mod["name"], mod.get("version"), "fail", str(e))
+        console.print(f"[red]Extraction failed: {e}[/red]")
+        sys.exit(1)
+
+    # ── Snapshot for rollback ─────────────────────────────────────────────────
+    try:
+        _save_snapshot(game, mod_id, mod.get("version"), archive)
+    except Exception as e:
+        log.warning("snapshot save failed for imported archive: %s", e)
+
+    # ── DB record ─────────────────────────────────────────────────────────────
+    new_dirs = sorted({p.name for p in mod_dir.iterdir() if p.is_dir()} - dirs_before)
+    if len(new_dirs) > 1:
+        console.print(
+            f"  [yellow]Multi-folder install:[/yellow] {len(new_dirs)} new folders — "
+            f"primary tracked as [cyan]{new_dirs[0]}[/cyan]; siblings: "
+            f"{', '.join(new_dirs[1:])}"
+        )
+    folder_name = new_dirs[0] if new_dirs else None
+
+    db.execute("""
+        INSERT INTO mods
+            (game, mod_id, file_id, name, version, filename, mod_dir,
+             folder_name, tracked_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(game, mod_id) DO UPDATE SET
+            file_id     = excluded.file_id,
+            name        = excluded.name,
+            version     = excluded.version,
+            filename    = excluded.filename,
+            mod_dir     = excluded.mod_dir,
+            folder_name = COALESCE(excluded.folder_name, mods.folder_name),
+            updated_at  = excluded.updated_at
+    """, (
+        game, mod_id, file_id_for_db, mod["name"], mod.get("version"),
+        archive.name, str(mod_dir), folder_name, now_iso(), now_iso(),
+    ))
+    db.commit()
+    record(db, "install", game, mod_id, mod["name"], mod.get("version"), "ok")
+
+    # ── Load order / plugins ──────────────────────────────────────────────────
+    load_order_file = (info or {}).get("load_order_file")
+    if load_order_file and not no_reorder and get_auto_reorder():
+        try:
+            result_lo = reconcile_load_order(game, db, mod_dir)
+            if new_dirs and result_lo["written"]:
+                console.print(f"  [dim]mod_load_order.txt ← {', '.join(new_dirs)}[/dim]")
+            if result_lo.get("cycles"):
+                console.print(
+                    f"  [yellow]⚠ Dependency cycle in load order: "
+                    f"{', '.join(result_lo['cycles'])}.[/yellow]"
+                )
+        except Exception as e:
+            log.warning("reconcile after import failed: %s", e)
+            console.print(f"  [yellow]Load order reconcile failed: {e}[/yellow]")
+
+    if plugin_exts:
+        new_plugins = sorted(_get_disk_plugins(mod_dir, plugin_exts) - plugins_before)
+        official_lower = {m.lower() for m in (info or {}).get("official_masters", ())}
+        tracked_plugins = [p for p in new_plugins if p.lower() not in official_lower]
+        if tracked_plugins:
+            for pname in tracked_plugins:
+                db.execute(
+                    "INSERT INTO plugin_files (game, mod_id, plugin_name, enabled, added_at) "
+                    "VALUES (?, ?, ?, 1, ?) "
+                    "ON CONFLICT(game, plugin_name) DO UPDATE SET "
+                    "mod_id = excluded.mod_id, added_at = excluded.added_at",
+                    (game, mod_id, pname, now_iso()),
+                )
+            db.commit()
+            try:
+                reconcile_plugins_txt(game, db, mod_dir)
+            except Exception as e:
+                log.warning("plugins.txt reconcile after import failed: %s", e)
+
+    log.info("import ok: game=%s mod_id=%s name=%r version=%s",
+             game, mod_id, mod["name"], mod.get("version"))
+    console.print(
+        f"\n[green]✓ Imported:[/green] {mod['name']} v{mod.get('version', '?')}"
+    )
 
 
 # list ────────────────────────────────────────────────────────────────────────
@@ -5126,7 +5402,10 @@ def uninstall_mod(ctx, game, mod_id, yes):
 @click.option("--with-api", is_flag=True,
               help="Also re-fetch missing version strings from Nexus API "
                    "(requires --fix; one API call per NULL-version row).")
-def fsck(game, fix, with_api):
+@click.option("--scan", is_flag=True,
+              help="Detect subdirectories in the mod folder not tracked in the DB, "
+                   "and offer to track them (requires GAME argument and an API key).")
+def fsck(game, fix, with_api, scan):
     """Audit the local mod database and repair drift.
 
     Scans tracked mods for: missing folder_name (legacy rows installed before
@@ -5144,6 +5423,8 @@ def fsck(game, fix, with_api):
     if not rows:
         scope = f"for '{game}'" if game else "in DB"
         console.print(f"[yellow]No mods tracked {scope}.[/yellow]")
+        if scan:
+            _fsck_scan(game, db)
         return
 
     # Cache mod_dir scans so repeated rows in the same dir don't re-walk it.
@@ -5234,6 +5515,8 @@ def fsck(game, fix, with_api):
 
     if not fix:
         console.print("\n[dim]Dry-run only. Re-run with [cyan]--fix[/cyan] to apply.[/dim]")
+        if scan:
+            _fsck_scan(game, db)
         return
 
     # Apply
@@ -5264,6 +5547,158 @@ def fsck(game, fix, with_api):
     )
     record(db, "fsck", game or "*", None, None, None, "ok",
            f"folder_name={applied_folders} version={applied_versions}")
+
+    # ── --scan: detect untracked folders ─────────────────────────────────────
+    if scan:
+        _fsck_scan(game, db)
+
+
+def _fsck_scan(game: str | None, db: sqlite3.Connection) -> None:
+    """Walk the mod directory for untracked subdirectories and offer to track them.
+
+    Requires a game argument and an API key (search and mod_info are free endpoints).
+    """
+    if not game:
+        console.print("[red]--scan requires a GAME argument.[/red]")
+        return
+
+    api_key = get_api_key()
+    info    = GAMES.get(game, {})
+    domain  = info.get("domain", game)
+    mod_dir = resolve_mod_dir(game, db)
+
+    if not mod_dir.exists():
+        console.print(f"[yellow]Mod directory does not exist: {mod_dir}[/yellow]")
+        return
+
+    # Build set of already-tracked folder names for this game.
+    tracked_folders = {
+        r["folder_name"]
+        for r in db.execute(
+            "SELECT folder_name FROM mods WHERE game = ? AND folder_name IS NOT NULL",
+            (game,),
+        ).fetchall()
+    }
+
+    console.print(f"\n[bold]fsck --scan:[/bold] scanning [dim]{mod_dir}[/dim]")
+
+    unknown = [
+        d for d in mod_dir.iterdir()
+        if d.is_dir() and d.name not in tracked_folders
+    ]
+
+    if not unknown:
+        console.print("[green]✓ No untracked folders found.[/green]")
+        return
+
+    console.print(f"  Found [yellow]{len(unknown)}[/yellow] untracked folder(s).\n")
+
+    n_found    = len(unknown)
+    n_tracked  = 0
+    n_skipped  = 0
+
+    for folder in unknown:
+        console.print(f"[bold]Unknown folder:[/bold] [cyan]{folder.name}[/cyan]")
+
+        # Search Nexus for possible matches.
+        try:
+            with console.status(f"  Searching Nexus for '{folder.name}'..."):
+                nodes = api_search_mods(domain, folder.name, api_key, count=5)
+        except Exception as e:
+            console.print(f"  [yellow]Search failed: {e}[/yellow]")
+            nodes = []
+
+        if nodes:
+            t = Table(box=None, padding=(0, 1), show_header=True)
+            t.add_column("#", style="dim", width=2)
+            t.add_column("Mod name", style="cyan")
+            t.add_column("Mod ID", justify="right")
+            t.add_column("Endorsements", justify="right", style="dim")
+            for i, node in enumerate(nodes[:5], 1):
+                t.add_row(
+                    str(i),
+                    node.get("name", "?"),
+                    str(node.get("modId", "?")),
+                    str(node.get("endorsements", "?")),
+                )
+            console.print(t)
+
+            choice = click.prompt(
+                "  Track this folder? Enter mod ID, 1-5 to pick from list, or [s]kip",
+                default="s",
+            ).strip().lower()
+
+            if choice == "s" or choice == "":
+                console.print("  [dim]Skipped.[/dim]")
+                n_skipped += 1
+                continue
+
+            mod_id: int | None = None
+            if choice.isdigit():
+                idx = int(choice)
+                if 1 <= idx <= len(nodes):
+                    mod_id = nodes[idx - 1].get("modId")
+                else:
+                    # Treat as a literal mod ID
+                    mod_id = int(choice)
+            else:
+                console.print("  [dim]Skipped.[/dim]")
+                n_skipped += 1
+                continue
+        else:
+            console.print("  [dim]No search results.[/dim]")
+            raw = click.prompt(
+                "  Enter mod ID to track, or [s]kip",
+                default="s",
+            ).strip().lower()
+            if raw == "s" or not raw.isdigit():
+                console.print("  [dim]Skipped.[/dim]")
+                n_skipped += 1
+                continue
+            mod_id = int(raw)
+
+        if mod_id is None:
+            console.print("  [dim]Skipped.[/dim]")
+            n_skipped += 1
+            continue
+
+        # Fetch mod info and insert into DB.
+        try:
+            with console.status(f"  Fetching mod {mod_id} info..."):
+                mod   = api_mod_info(domain, mod_id, api_key)
+                files = api_mod_files(domain, mod_id, api_key)
+        except SystemExit:
+            console.print(f"  [red]Could not fetch mod {mod_id}.[/red]")
+            n_skipped += 1
+            continue
+
+        chosen = pick_main_file(files)
+        db.execute("""
+            INSERT OR IGNORE INTO mods
+                (game, mod_id, file_id, name, version, filename, mod_dir,
+                 folder_name, tracked_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            game, mod_id,
+            chosen["file_id"] if chosen else 0,
+            mod["name"], mod.get("version"),
+            chosen["file_name"] if chosen else None,
+            str(mod_dir),
+            folder.name,
+            now_iso(),
+        ))
+        db.commit()
+        record(db, "track", game, mod_id, mod["name"], mod.get("version"), "ok")
+        console.print(
+            f"  [green]✓[/green] Tracked: [bold]{mod['name']}[/bold] "
+            f"v{mod.get('version', '?')} (folder: [cyan]{folder.name}[/cyan])"
+        )
+        n_tracked += 1
+
+    console.print(
+        f"\n[bold]Scan complete:[/bold] {n_found} folder(s) found, "
+        f"[green]{n_tracked} tracked[/green], [dim]{n_skipped} skipped[/dim]."
+    )
 
 
 # rollback / snapshots ────────────────────────────────────────────────────────
@@ -5490,10 +5925,30 @@ def nxm_handle(uri, no_reorder):
 
     api_key = get_api_key()
     db = get_db()
-    name, version = do_install(
-        game, parsed["mod_id"], parsed["file_id"], api_key, db,
-        nxm_key=parsed["key"], nxm_expires=parsed["expires"], nxm_user_id=parsed["user_id"],
-    )
+    try:
+        name, version = do_install(
+            game, parsed["mod_id"], parsed["file_id"], api_key, db,
+            nxm_key=parsed["key"], nxm_expires=parsed["expires"], nxm_user_id=parsed["user_id"],
+        )
+    except RuntimeError as e:
+        msg = str(e)
+        if "no download urls" in msg.lower() or "premium required" in msg.lower():
+            # Free users cannot get API download URLs even with a valid NXM key.
+            # Open the mod's files page so the user can download manually.
+            info = GAMES.get(game, {})
+            domain = info.get("domain", parsed["domain"])
+            mod_page = (
+                f"https://www.nexusmods.com/{domain}/mods/{parsed['mod_id']}?tab=files"
+            )
+            console.print(
+                f"\n[yellow]This download requires a Nexus Premium account.[/yellow]\n"
+                f"Opening mod files page in your browser so you can download manually.\n"
+                f"Then install with:\n"
+                f"  [cyan]nexmod import {game} <path-to-downloaded-file>[/cyan]"
+            )
+            webbrowser.open(mod_page)
+            sys.exit(0)
+        raise
     console.print(f"\n[green]✓ Installed:[/green] {name} v{version}")
 
 
@@ -5579,36 +6034,108 @@ def nxm_unregister():
 
 # enable / disable / toggle ───────────────────────────────────────────────────
 
+_DTKIT_NATIVE_URL = (
+    "https://github.com/ManShanko/dtkit-patch/releases/latest/download/"
+    "dtkit-patch-x86_64-unknown-linux-musl.tar.gz"
+)
+
+
 def _find_dtkit(game_dir: Path) -> Path | None:
-    for name in ("dtkit-patch.exe", "dtkit-patch"):
+    """Return the dtkit-patch binary path, preferring the native Linux binary."""
+    # Native Linux binary takes priority; .exe is the legacy Wine fallback.
+    for name in ("dtkit-patch", "dtkit-patch.exe"):
         p = game_dir / "tools" / name
         if p.exists():
             return p
     return None
 
+
+def _download_dtkit(game_dir: Path) -> Path:
+    """Download the native Linux dtkit-patch binary into <game_dir>/tools/.
+
+    Fetches the musl-static release tarball from GitHub, extracts the binary,
+    marks it executable, and returns its path.
+
+    Raises:
+        RuntimeError: if the download, extraction, or binary-not-found step fails.
+    """
+    tools_dir = game_dir / "tools"
+    tools_dir.mkdir(parents=True, exist_ok=True)
+    dest = tools_dir / "dtkit-patch"
+
+    console.print(f"  Downloading dtkit-patch (native Linux binary)...")
+    try:
+        r = requests.get(_DTKIT_NATIVE_URL, stream=True, timeout=60)
+        r.raise_for_status()
+    except requests.RequestException as e:
+        raise RuntimeError(f"Failed to download dtkit-patch: {e}") from e
+
+    data = r.content
+    try:
+        with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as tf:
+            # Find the binary member — could be at root or in a subdirectory.
+            member = None
+            for m in tf.getmembers():
+                if m.name.split("/")[-1] in ("dtkit-patch", "dtkit-patch-x86_64-unknown-linux-musl"):
+                    member = m
+                    break
+            if not member:
+                raise RuntimeError(
+                    "dtkit-patch binary not found inside downloaded tarball. "
+                    "Download it manually from https://github.com/ManShanko/dtkit-patch/releases"
+                )
+            fobj = tf.extractfile(member)
+            if fobj is None:
+                raise RuntimeError("Could not read binary from tarball")
+            dest.write_bytes(fobj.read())
+    except RuntimeError:
+        raise
+    except Exception as e:
+        raise RuntimeError(f"Failed to extract dtkit-patch: {e}") from e
+
+    dest.chmod(0o755)
+    console.print(f"  [green]✓[/green] dtkit-patch installed at {dest}")
+    log.info("dtkit-patch downloaded and installed at %s", dest)
+    return dest
+
+
 def _run_dtkit(game_dir: Path, action: str) -> tuple[bool, str]:
-    """Run dtkit-patch via Wine. action: --patch | --unpatch | --toggle"""
-    if not shutil.which("wine"):
-        return False, (
-            "Wine not found. Install it:\n"
-            "  Ubuntu/Debian: sudo apt install wine\n"
-            "  Arch:          sudo pacman -S wine\n"
-            "  Fedora:        sudo dnf install wine\n"
-            "  openSUSE:      sudo zypper install wine\n"
-            "  Flatpak:       flatpak install flathub org.winehq.Wine"
-        )
+    """Run dtkit-patch. Uses the native Linux binary if present; falls back to Wine + .exe.
+
+    action: --patch | --unpatch | --toggle
+    """
     dtkit = _find_dtkit(game_dir)
     if not dtkit:
-        return False, f"dtkit-patch.exe not found in {game_dir}/tools/"
+        return False, (
+            "dtkit-patch not found in {}/tools/.\n"
+            "Run: nexmod setup --game darktide  (auto-downloads the native binary)\n"
+            "Or download manually from "
+            "https://github.com/ManShanko/dtkit-patch/releases"
+        ).format(game_dir)
 
-    bundle_win = f"Z:{game_dir}/bundle"
-    env = {**os.environ, "WINEPREFIX": str(WINE_PREFIX), "WINEDEBUG": "-all"}
-    result = subprocess.run(
-        ["wine", str(dtkit), action, bundle_win],
-        capture_output=True, text=True, env=env,
-    )
+    is_native = dtkit.suffix != ".exe"
+
+    if is_native:
+        bundle_dir = str(game_dir / "bundle")
+        cmd = [str(dtkit), action, bundle_dir]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+    else:
+        # Legacy Wine path for users who still have dtkit-patch.exe.
+        if not shutil.which("wine"):
+            return False, (
+                "dtkit-patch.exe found but Wine is not installed.\n"
+                "Either install Wine or replace dtkit-patch.exe with the native "
+                "Linux binary — run: nexmod setup --game darktide"
+            )
+        bundle_win = f"Z:{game_dir}/bundle"
+        env = {**os.environ, "WINEPREFIX": str(WINE_PREFIX), "WINEDEBUG": "-all"}
+        result = subprocess.run(
+            ["wine", str(dtkit), action, bundle_win],
+            capture_output=True, text=True, env=env,
+        )
+
     output = (result.stdout + result.stderr).strip()
-    # filter radv noise
+    # filter radv / Wine debug noise
     clean = "\n".join(l for l in output.splitlines() if "radv" not in l.lower())
     log.debug("dtkit exit=%s output=%r", result.returncode, clean)
     return result.returncode == 0, clean

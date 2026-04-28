@@ -7,7 +7,7 @@
 
 A Linux-native CLI mod manager for [Nexus Mods](https://www.nexusmods.com/).
 
-> **Requires a Nexus Mods Premium account** — the download API is Premium-only.
+> **Premium account recommended** — the API download endpoint requires Premium. Free users can use `nexmod import` to install a manually-downloaded archive, or `nexmod nxm` which will open the Nexus files page automatically when Premium is not available.
 
 ---
 
@@ -23,15 +23,16 @@ A Linux-native CLI mod manager for [Nexus Mods](https://www.nexusmods.com/).
 - **Missing-dependency detection** — every `nexmod update` scans the inventory; `--fix-deps` installs the gaps interactively
 - **Conflict detection** — peeks archives before extracting; warns when a mod would overwrite another tracked mod's folder
 - **Network resilience** — Range-resume on download interruption, retries with exponential backoff, honors `Retry-After` on 429, falls back across CDN mirrors
-- **Pre-flight `nexmod doctor`** — verifies API + Premium + Steam + Wine + 7z + disk + DB before you install anything
-- **`nexmod fsck`** — audits and repairs DB drift (legacy rows missing `folder_name`, version mismatches)
+- **Pre-flight `nexmod doctor`** — verifies API + Premium + Steam + dtkit-patch + 7z + disk + DB before you install anything
+- **`nexmod fsck`** — audits and repairs DB drift (legacy rows missing `folder_name`, version mismatches); `--scan` detects untracked folders in the mod directory and offers to track them
+- **`nexmod import`** — install a locally-downloaded archive without Premium; auto-detects mod ID from Nexus filename convention
 - Vortex import — reads `vortex.deployment.json`, no re-downloads
 - Steam (native + Flatpak) and Wine/Proton paths auto-detected
 - Atomic downloads with MD5 verification before extraction
 - `.zip`, `.tar.gz`, `.tar.bz2`, `.tar.xz`, `.7z` archives supported
 - Disk-space pre-check before download/extract
 - Path-traversal protection (rejects `../` and absolute paths in archives)
-- Darktide: enable/disable mod loading via dtkit-patch through Wine
+- Darktide: enable/disable mod loading via native `dtkit-patch` Linux binary (auto-downloaded by `nexmod setup`); Wine `.exe` fallback for legacy setups
 - `diag` surfaces mod errors from the game's own log
 - Full operation history in a local SQLite DB; no telemetry, no daemons
 
@@ -143,8 +144,9 @@ nexmod profile load darktide full        # back to full
 
 | Command | Flags | Description |
 |---------|-------|-------------|
-| `nexmod install <game> <mod_id>` | `--file-id N`, `--no-reorder`, `--dry-run` | Download, extract, track. Accepts a Nexus URL in place of `<game> <mod_id>`. `--dry-run` resolves metadata + prints what would happen without fetching. Conflict detection: if the archive's top-level folder is already claimed by another tracked mod, you'll be prompted before overwriting. |
+| `nexmod install <game> <mod_id>` | `--file-id N`, `--no-reorder`, `--dry-run` | Download, extract, track. Accepts a Nexus URL in place of `<game> <mod_id>`. `--dry-run` resolves metadata + prints what would happen without fetching. Conflict detection: if the archive's top-level folder is already claimed by another tracked mod, you'll be prompted before overwriting. **Requires Premium.** |
 | `nexmod install <nexus-url>` | (same) | URL form — game and mod ID parsed from the URL. |
+| `nexmod import <game> <path>` | `--mod-id N`, `-y/--yes`, `--no-reorder` | **Free-tier workflow.** Install a locally-downloaded archive. Auto-detects the Nexus mod ID from the filename convention (`<Name>-<mod_id>-<file_id>-<ver>.zip`). Fetches metadata from the API (free endpoint), extracts, and registers in the DB. Same extraction logic as `install`: conflict detection, snapshot for rollback, Darktide load-order reconcile. |
 | `nexmod track <game> <mod_id>` | — | Record an already-installed mod for update tracking. URL form supported. |
 | `nexmod scan <game>` | `--dry-run` | Import all mods from `vortex.deployment.json`. |
 | `nexmod remove <game> <mod_id>` | `--purge`, `--yes`, `--dry-run`, `--force-legacy-purge` | Untrack. `--purge` also deletes the mod folder (with confirmation; `--yes` skips). Rows missing `folder_name` (legacy installs) refuse to purge unless `--force-legacy-purge` is set — run `nexmod fsck --fix` first. |
@@ -241,16 +243,16 @@ Snapshots are written automatically after every successful install/update to
 |---------|-------------|
 | `nexmod nxm-register` | Write `~/.local/share/applications/nexmod-nxm.desktop` and register it via `xdg-mime` as the system handler for `nxm://` links. |
 | `nexmod nxm-unregister` | Remove the registration. |
-| `nexmod nxm <uri>` | Manually handle an `nxm://` URI. Usually invoked by the system handler after registration; safe to paste a URI yourself. |
+| `nexmod nxm <uri>` | Manually handle an `nxm://` URI. Usually invoked by the system handler after registration; safe to paste a URI yourself. If the download requires Premium and your account is free, nexmod opens the mod's files page in your browser and prints `nexmod import <game> <path>` as the next step. |
 
 After `nxm-register`, clicking "Mod Manager Download" on any Nexus mod page
-launches nexmod and starts the install.
+launches nexmod and starts the install. Free users: the button still triggers nexmod, which opens the download page so you can save the file manually.
 
 ### Mod loader (Darktide)
 
 | Command | Description |
 |---------|-------------|
-| `nexmod enable <game>` | Run dtkit-patch via Wine to enable mod loading. |
+| `nexmod enable <game>` | Run dtkit-patch (native Linux binary, no Wine required) to enable mod loading. `nexmod setup` downloads the binary automatically. |
 | `nexmod disable <game>` | Unpatch (disable mod loading). |
 | `nexmod toggle <game>` | Flip patch state. |
 
@@ -258,8 +260,8 @@ launches nexmod and starts the install.
 
 | Command | Flags | Description |
 |---------|-------|-------------|
-| `nexmod doctor` | `--game <slug>` | Pre-flight environment check: API key + Premium, Steam libraries, per-game install paths, Wine + 7z presence, disk space, DB integrity. Exits 1 if any required check fails; warnings are advisory. |
-| `nexmod fsck [<game>]` | `--fix`, `--with-api` | Audit the local DB. Reports legacy rows missing `folder_name` and version. With `--fix`, auto-backfills folder names by 4-strategy inference (filename stem → mod.json name → .mod title → fuzzy match), refusing collisions. With `--with-api --fix`, also re-fetches missing version strings from Nexus. |
+| `nexmod doctor` | `--game <slug>` | Pre-flight environment check: API key + Premium, Steam libraries, per-game install paths, dtkit-patch + 7z presence, disk space, DB integrity. Exits 1 if any required check fails; warnings are advisory. |
+| `nexmod fsck [<game>]` | `--fix`, `--with-api`, `--scan` | Audit the local DB. Reports legacy rows missing `folder_name` and version. With `--fix`, auto-backfills folder names. With `--with-api --fix`, also re-fetches missing version strings from Nexus. With `--scan`, walks the mod folder for subdirectories not in the DB and offers to track them (requires game argument + API key). |
 | `nexmod path set <game> <dir>` | — | Override auto-detected mod directory. |
 | `nexmod path show <game>` | — | Print the resolved mod directory. |
 | `nexmod diag <game>` | `--lines N`, `--all` | Surface mod errors from the game's own log file. |

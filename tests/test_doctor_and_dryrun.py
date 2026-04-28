@@ -117,7 +117,8 @@ def test_install_dry_run_does_not_download(runner):
     assert "test.zip" in result.output
 
 
-def test_install_dry_run_warns_missing_wine_for_darktide(runner):
+def test_install_dry_run_warns_missing_dtkit_for_darktide(runner):
+    """install --dry-run warns about missing dtkit-patch for Darktide (not Wine)."""
     nexmod.CONFIG_FILE.write_text(json.dumps({"api_key": "OK"}))
     api = nexmod.NEXUS_API
     with resp_lib.RequestsMock() as rsps:
@@ -130,7 +131,8 @@ def test_install_dry_run_warns_missing_wine_for_darktide(runner):
                       "uploaded_timestamp": 1}
                  ]})
         with patch("nexmod.resolve_mod_dir", return_value=Path("/tmp/mods")), \
-             patch("nexmod.shutil.which", return_value=None):
+             patch("nexmod._find_dtkit", return_value=None):
             result = runner.invoke(cli, ["install", "darktide", "1", "--dry-run"])
     assert result.exit_code == 0
-    assert "wine not found" in result.output.lower()
+    # dry-run now warns about missing dtkit-patch, not Wine
+    assert "dtkit" in result.output.lower() or "enable" in result.output.lower()
