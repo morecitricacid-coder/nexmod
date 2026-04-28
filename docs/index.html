@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>nexmod — Nexus Mods manager for Linux</title>
-<meta name="description" content="Vortex doesn't run on Linux. nexmod does. A simple CLI for installing and updating Nexus mods — works great from the terminal, works even better when your LLM agents run it. Premium required.">
+<meta name="description" content="Vortex doesn't run on Linux. nexmod does. Search, install, update, and rollback Nexus mods from the terminal. JSON output for LLM agents and scripts. Premium required.">
 <meta property="og:title" content="nexmod — Nexus Mods manager for Linux">
 <meta property="og:description" content="Install, update, and hotswap mod profiles from the terminal. No Wine-wrapped GUI.">
 <meta property="og:type" content="website">
@@ -430,7 +430,7 @@ footer{
     </div>
 
     <div class="hero-links">
-      <a href="https://pypi.org/project/nexmod/" class="pill pill-live">v0.3.0 · PyPI</a>
+      <a href="https://pypi.org/project/nexmod/" class="pill pill-live">v0.9.0 · PyPI</a>
       <a href="https://github.com/morecitricacid-coder/nexmod/actions/workflows/ci.yml" class="pill">CI passing</a>
       <span class="pill">MIT</span>
       <span class="pill">Python 3.10+</span>
@@ -521,6 +521,24 @@ footer{
         <span class="ftag">nexmod doctor</span>
         <span class="ftag">nexmod rollback darktide 1234</span>
         <span class="ftag">nexmod fsck --fix</span>
+      </div>
+    </div>
+
+    <div class="feat">
+      <span class="feat-icon">⌕</span>
+      <div class="feat-title">Search &amp; discover</div>
+      <div class="feat-desc">
+        Search Nexus Mods by name from the terminal — no browser needed. Results include
+        mod ID, summary, downloads, and endorsements sorted by popularity. Pass
+        <code style="font-family:monospace;font-size:0.82em">--json</code> for structured
+        output that LLM agents and scripts can parse directly.
+        <code style="font-family:monospace;font-size:0.82em">info --remote</code> fetches
+        full mod details without installing first.
+      </div>
+      <div class="feat-tags">
+        <span class="ftag">nexmod search darktide "enemy health"</span>
+        <span class="ftag">--json</span>
+        <span class="ftag">nexmod info darktide 1234 --remote</span>
       </div>
     </div>
   </div>
@@ -664,7 +682,7 @@ footer{
       <a href="https://github.com/morecitricacid-coder/nexmod">GitHub</a>
       <a href="https://pypi.org/project/nexmod/">PyPI</a>
       <a href="https://github.com/morecitricacid-coder/nexmod/blob/main/CHANGELOG.md">Changelog</a>
-      <span>v0.3.0</span>
+      <span>v0.9.0</span>
       <span>MIT</span>
     </div>
   </div>
@@ -691,6 +709,12 @@ const SCRIPT = [
   { k:'out', h:'<span class="tok">✓</span>  <span class="tout">7z            /usr/bin/7z</span>' },
   { k:'out', h:'<span class="tok">✓</span>  <span class="tout">Disk space    148 GB free</span>' },
   { k:'out', h:'<span class="tok">All checks passed.</span>' },
+  { k:'blank' },
+  { k:'cmd', t:'nexmod search darktide "enemy health"' },
+  { k:'out', h:'<span class="tdim">  ID      Name                         Summary</span>' },
+  { k:'out', h:'  <span class="tamb">68751</span>   <span class="tout">Enemy Health Bars            </span><span class="tdim">Show HP above enemies...</span>' },
+  { k:'out', h:'  <span class="tamb">43210</span>   <span class="tout">Thick Health Numbers         </span><span class="tdim">Bigger, clearer HP readouts...</span>' },
+  { k:'out', h:'<span class="tdim">Install: nexmod install darktide 68751</span>' },
   { k:'blank' },
   { k:'cmd', t:'nexmod update darktide -y' },
   { k:'out', h:'<span class="tdim">Checking 32 mods for updates...</span>' },

@@ -6,6 +6,7 @@ import requests
 import sqlite3
 import json
 import os
+import struct
 import subprocess
 import zipfile
 import tarfile
@@ -26,7 +27,7 @@ from rich.table import Table
 from rich.progress import Progress, DownloadColumn, TransferSpeedColumn, BarColumn, TextColumn
 from rich.syntax import Syntax
 
-__version__ = "0.3.0"
+__version__ = "0.9.0"
 
 console = Console()
 log = logging.getLogger("nexmod")
@@ -94,6 +95,21 @@ GAMES = {
         "steam_id": 1716740,
         "mod_subdir": "Data",
         "log_subpath": None,
+        # Bethesda plugin system: .esp/.esm/.esl files tracked + Plugins.txt managed
+        "plugin_exts": (".esm", ".esp", ".esl"),
+        # Relative to AppData/Local inside the Proton prefix
+        "appdata_plugins_txt": "Starfield/plugins.txt",
+        # These are always first in Plugins.txt — nexmod never touches their order
+        "official_masters": (
+            "Starfield.esm",
+            "BlueprintShips-Starfield.esm",
+            "OldMars.esm",
+            "SFBGS003.esm",
+            "SFBGS004.esm",
+            "SFBGS006.esm",
+            "SFBGS007.esm",
+            "SFBGS008.esm",
+        ),
     },
 }
 
@@ -225,9 +241,26 @@ def get_db() -> sqlite3.Connection:
 # Schema migrations: append-only list. Each entry runs exactly once and is
 # recorded in schema_migrations. To change schema, ADD a new entry — never
 # reorder, never delete. Forward-fix instead.
-SCHEMA_MIGRATIONS: list[tuple[str, str]] = [
+def _migration_003_plugin_files(conn: sqlite3.Connection) -> None:
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS plugin_files (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            game        TEXT NOT NULL,
+            mod_id      INTEGER NOT NULL,
+            plugin_name TEXT NOT NULL,
+            enabled     INTEGER NOT NULL DEFAULT 1,
+            added_at    TEXT NOT NULL,
+            UNIQUE(game, plugin_name)
+        );
+        CREATE INDEX IF NOT EXISTS idx_plugin_files_game_mod
+            ON plugin_files(game, mod_id);
+    """)
+
+
+SCHEMA_MIGRATIONS: list = [
     ("001_mods_folder_name", "ALTER TABLE mods ADD COLUMN folder_name TEXT"),
     ("002_load_order_active_profile", "ALTER TABLE load_order_state ADD COLUMN active_profile TEXT"),
+    ("003_plugin_files", _migration_003_plugin_files),
 ]
 
 
@@ -419,6 +452,77 @@ def api_download_urls(domain: str, mod_id: int, file_id: int, api_key: str, *,
 def api_updated_mods(domain: str, api_key: str, period: str = "1w") -> list:
     return nexus_get(f"games/{domain}/mods/updated.json?period={period}", api_key)
 
+def api_search_mods(domain: str, query: str, api_key: str, count: int = 10) -> list:
+    """Search Nexus mods via the v2 GraphQL API.
+
+    Uses ``nameStemmed`` with a WILDCARD ``*query*`` pattern — the ``name``
+    field returns zero hits for WILDCARD queries as of 2026-04.
+
+    Args:
+        domain:  Nexus game domain slug (e.g. ``warhammer40kdarktide``).
+        query:   Free-text search string.
+        api_key: Nexus API key.
+        count:   Number of results to return (1–50).
+
+    Returns:
+        List of result dicts with keys ``modId``, ``name``, ``summary``,
+        ``downloads``, ``endorsements``.
+
+    Raises:
+        RuntimeError: on non-200 HTTP responses or malformed responses.
+    """
+    count = max(1, min(50, count))
+    url = "https://api.nexusmods.com/v2/graphql"
+    gql_query = """
+query ModSearch($filter: ModsFilter!, $offset: Int, $count: Int) {
+  mods(filter: $filter, offset: $offset, count: $count) {
+    totalCount
+    nodes {
+      modId
+      name
+      summary
+      downloads
+      endorsements
+    }
+  }
+}
+"""
+    payload = {
+        "query": gql_query,
+        "variables": {
+            "filter": {
+                "op": "AND",
+                "gameDomainName": [{"value": domain, "op": "EQUALS"}],
+                "nameStemmed": [{"value": f"*{query}*", "op": "WILDCARD"}],
+            },
+            "offset": 0,
+            "count": count,
+        },
+    }
+    headers = {
+        "APIKEY": api_key,
+        "Application-Name": "nexmod",
+        "Application-Version": __version__,
+        "Protocol-Version": "1.0.0",
+        "Content-Type": "application/json",
+    }
+    log.debug("GraphQL search: domain=%s query=%r count=%d", domain, query, count)
+    try:
+        r = requests.post(url, json=payload, headers=headers, timeout=20)
+    except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
+        raise RuntimeError(f"Network error contacting Nexus v2 API: {e}") from e
+    if r.status_code != 200:
+        raise RuntimeError(
+            f"Nexus v2 GraphQL returned HTTP {r.status_code}: {r.text[:200]}"
+        )
+    try:
+        body = r.json()
+    except ValueError as e:
+        raise RuntimeError(f"Nexus v2 GraphQL returned non-JSON response: {e}") from e
+    data = body.get("data") or {}
+    mods_block = data.get("mods") or {}
+    return mods_block.get("nodes") or []
+
 
 # ── Steam Path Detection ──────────────────────────────────────────────────────
 
@@ -480,6 +584,38 @@ def find_proton_appdata(steam_id: int) -> Path | None:
         if candidate.exists():
             return candidate
     return None
+
+
+def find_appdata_local(steam_id: int) -> Path | None:
+    """Return the Wine AppData/Local path for a Proton game (different from Roaming)."""
+    _pfx = f"steamapps/compatdata/{steam_id}/pfx/drive_c/users/steamuser/AppData/Local"
+    search_roots = [
+        Path.home() / ".local/share/Steam",
+        Path.home() / ".steam/steam",
+        Path.home() / ".var/app/com.valvesoftware.Steam/.local/share/Steam",
+    ]
+    for root in search_roots:
+        candidate = root / _pfx
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def find_plugins_txt(game: str) -> Path | None:
+    """Locate Plugins.txt for a Bethesda game running under Proton.
+
+    Uses 'appdata_plugins_txt' from GAMES config (relative to AppData/Local).
+    Returns None if the Proton prefix doesn't exist yet (game never launched).
+    """
+    info = GAMES.get(game, {})
+    rel = info.get("appdata_plugins_txt")
+    steam_id = info.get("steam_id")
+    if not rel or not steam_id:
+        return None
+    local = find_appdata_local(steam_id)
+    if local is None:
+        return None
+    return local / rel
 
 
 # ── Download & Extract ────────────────────────────────────────────────────────
@@ -1292,6 +1428,8 @@ def do_install(game: str, mod_id: int, file_id_override: int | None,
                 raise
 
     dirs_before = {p.name for p in mod_dir.iterdir() if p.is_dir()} if mod_dir.exists() else set()
+    plugin_exts = (info or {}).get("plugin_exts", ())
+    plugins_before = _get_disk_plugins(mod_dir, plugin_exts) if (mod_dir.exists() and plugin_exts) else set()
 
     extraction_ok = False
     try:
@@ -1398,6 +1536,37 @@ def do_install(game: str, mod_id: int, file_id_override: int | None,
             log.warning("reconcile after install failed: %s", e)
             console.print(f"  [yellow]Load order reconcile failed: {e}[/yellow]")
 
+    # ── Bethesda plugin tracking (Starfield, etc.) ────────────────────────────
+    if plugin_exts:
+        new_plugins = sorted(_get_disk_plugins(mod_dir, plugin_exts) - plugins_before)
+        official_lower = {m.lower() for m in (info or {}).get("official_masters", ())}
+        tracked_plugins = [p for p in new_plugins if p.lower() not in official_lower]
+        if tracked_plugins:
+            for pname in tracked_plugins:
+                db.execute(
+                    "INSERT INTO plugin_files (game, mod_id, plugin_name, enabled, added_at) "
+                    "VALUES (?, ?, ?, 1, ?) "
+                    "ON CONFLICT(game, plugin_name) DO UPDATE SET mod_id = excluded.mod_id, added_at = excluded.added_at",
+                    (game, mod_id, pname, now_iso()),
+                )
+            db.commit()
+            try:
+                result = reconcile_plugins_txt(game, db, mod_dir)
+                if result.get("written"):
+                    console.print(f"  [dim]Plugins.txt ← {', '.join(tracked_plugins)}[/dim]")
+                if result.get("cycles"):
+                    console.print(
+                        f"  [yellow]⚠ Plugin dependency cycle: {', '.join(result['cycles'])}. "
+                        f"Appended at end — check load order with [cyan]nexmod plugin-order {game}[/cyan].[/yellow]"
+                    )
+                if result.get("error"):
+                    console.print(f"  [yellow]Plugins.txt: {result['error']}[/yellow]")
+            except Exception as e:
+                log.warning("plugins.txt reconcile after install failed: %s", e)
+                console.print(f"  [yellow]Plugins.txt update failed: {e}[/yellow]")
+        elif new_plugins:
+            console.print(f"  [dim]No plugin files (.esp/.esm/.esl) found — mod uses loose files or BA2 archives.[/dim]")
+
     return mod["name"], mod.get("version", "?")
 
 
@@ -1426,6 +1595,296 @@ def parse_vortex_manifest(game_dir: Path) -> dict[int, tuple[str, str]]:
         folder = rel.split("/")[1] if rel.startswith("mods/") else ""
         seen[mod_id] = (name, folder)
     return seen
+
+
+# ── Bethesda Plugin Management ────────────────────────────────────────────────
+#
+# For games like Starfield that use a Plugins.txt load order file located in
+# the Wine/Proton AppData/Local prefix (outside the mod directory). These games
+# have plugin files (.esp/.esm/.esl) that must be listed in Plugins.txt to load,
+# plus loose files and BA2 archives that are auto-loaded without any entry.
+#
+# Architecture mirrors the Darktide load order system:
+#   reconcile_plugins_txt()  ↔  reconcile_load_order()
+#   plugin_files DB table    ↔  load_order_state DB table
+#   _read_plugin_masters()   ↔  _parse_mod_deps()
+# ─────────────────────────────────────────────────────────────────────────────
+
+PLUGINS_TXT_HEADER = (
+    "# This file is used by Starfield to keep track of your downloaded content.\n"
+    "# Please do not modify this file.\n"
+)
+
+
+def _get_disk_plugins(mod_dir: Path, plugin_exts: tuple) -> set[str]:
+    """Return set of plugin filenames (case-insensitive extensions) at root of mod_dir."""
+    if not mod_dir.exists():
+        return set()
+    return {
+        p.name for p in mod_dir.iterdir()
+        if p.is_file() and p.suffix.lower() in plugin_exts
+    }
+
+
+def _read_plugin_masters(plugin_path: Path) -> list[str]:
+    """Parse the TES4 record header of a .esp/.esm/.esl to extract master (MAST) dependencies.
+
+    Returns list of master filenames declared in the plugin header.
+    Returns [] on any parse failure (corrupt file, wrong format, etc.).
+
+    TES4 record layout (24-byte header):
+      [0:4]   record type ("TES4")
+      [4:8]   data_size uint32 LE  — subrecord area size (excludes this 24-byte header)
+      [8:12]  flags uint32 LE
+      [12:16] FormID uint32 LE (always 0 for TES4)
+      [16:24] version-control info (8 bytes, ignored)
+
+    Subrecord layout (6-byte header + data):
+      [0:4]   subrecord type (e.g. "MAST", "HEDR", "CNAM")
+      [4:6]   data_size uint16 LE
+      [6:N]   data (N = data_size)
+
+    MAST subrecord data: null-terminated UTF-8 string (master filename).
+    """
+    masters: list[str] = []
+    try:
+        with open(plugin_path, "rb") as f:
+            hdr = f.read(24)
+            if len(hdr) < 24 or hdr[:4] != b"TES4":
+                return masters
+            data_size = struct.unpack_from("<I", hdr, 4)[0]
+            read = 0
+            while read < data_size:
+                sub_hdr = f.read(6)
+                if len(sub_hdr) < 6:
+                    break
+                sub_type = sub_hdr[:4]
+                sub_size = struct.unpack_from("<H", sub_hdr, 4)[0]
+                sub_data = f.read(sub_size)
+                if len(sub_data) < sub_size:
+                    break
+                read += 6 + sub_size
+                if sub_type == b"MAST":
+                    name = sub_data.rstrip(b"\x00").decode("utf-8", errors="replace").strip()
+                    if name:
+                        masters.append(name)
+    except (OSError, struct.error) as e:
+        log.debug("plugin master parse failed for %s: %s", plugin_path, e)
+    return masters
+
+
+def _parse_plugins_txt(path: Path) -> dict:
+    """Parse Plugins.txt into structured form.
+
+    Returns:
+        {"header": [comment lines before first entry],
+         "entries": [{"name": "Mod.esm", "enabled": True}, ...]}
+    """
+    if not path.exists():
+        return {"header": [], "entries": []}
+    lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    header: list[str] = []
+    entries: list[dict] = []
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped.startswith("#"):
+            if not entries:
+                header.append(stripped)
+        else:
+            enabled = stripped.startswith("*")
+            entries.append({"name": stripped[1:] if enabled else stripped, "enabled": enabled})
+    return {"header": header, "entries": entries}
+
+
+def _write_plugins_txt(path: Path, entries: list[dict], dry_run: bool = False) -> str:
+    """Atomically write Plugins.txt. Returns the rendered content string."""
+    lines = [PLUGINS_TXT_HEADER]
+    for e in entries:
+        prefix = "*" if e["enabled"] else ""
+        lines.append(f"{prefix}{e['name']}\n")
+    content = "".join(lines)
+    if dry_run:
+        return content
+    path.parent.mkdir(parents=True, exist_ok=True)
+    bak = path.with_suffix(".bak")
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(content, encoding="utf-8")
+    tmp_fd = None
+    try:
+        tmp_fd = os.open(str(tmp), os.O_RDONLY)
+        os.fsync(tmp_fd)
+    except OSError:
+        pass
+    finally:
+        if tmp_fd is not None:
+            os.close(tmp_fd)
+    if path.exists():
+        shutil.copy2(path, bak)
+    os.replace(tmp, path)
+    return content
+
+
+def _plugins_topo_sort(plugins: list[str], deps_map: dict[str, list[str]]) -> tuple[list[str], list[str]]:
+    """Topological sort of plugins by their master dependencies (Kahn's algorithm).
+
+    Args:
+        plugins:  ordered list of plugin names to sort (non-official only)
+        deps_map: {plugin_name: [master_names_it_depends_on]} (only names in `plugins` matter)
+
+    Returns:
+        (sorted_list, cycle_members) — cycle members appended at end, not interleaved.
+    """
+    in_set = set(plugins)
+    # Only count deps that are in our set (ignore missing masters — they're official or external)
+    filtered_deps: dict[str, list[str]] = {
+        p: [d for d in deps_map.get(p, []) if d.lower() in {x.lower() for x in in_set}]
+        for p in plugins
+    }
+    in_degree: dict[str, int] = {p: 0 for p in plugins}
+    dependents: dict[str, list[str]] = {p: [] for p in plugins}
+    # Use case-insensitive matching for plugin names (Windows filenames)
+    lower_map = {p.lower(): p for p in plugins}
+    for p, deps in filtered_deps.items():
+        for d in deps:
+            canonical = lower_map.get(d.lower())
+            if canonical:
+                in_degree[p] += 1
+                dependents[canonical].append(p)
+
+    queue = [p for p in plugins if in_degree[p] == 0]
+    sorted_list: list[str] = []
+    while queue:
+        node = queue.pop(0)
+        sorted_list.append(node)
+        for dep in dependents[node]:
+            in_degree[dep] -= 1
+            if in_degree[dep] == 0:
+                queue.append(dep)
+
+    cycles = [p for p in plugins if p not in sorted_list]
+    return sorted_list, cycles
+
+
+def reconcile_plugins_txt(
+    game: str,
+    db: sqlite3.Connection,
+    mod_dir: Path,
+    *,
+    dry_run: bool = False,
+    force_drop: set[str] | None = None,
+) -> dict:
+    """Reconcile Plugins.txt for a Bethesda plugin game.
+
+    Classifies all known plugins, dependency-sorts them, and writes the result.
+    Mirrors reconcile_load_order() for Darktide-style games.
+
+    Classification:
+        official   – in game's official_masters config: always first, protected
+        managed    – tracked in plugin_files DB table
+        foreign    – on disk but not tracked (preserved, appended after managed)
+        orphan     – in Plugins.txt but not on disk (dropped)
+
+    Returns dict with: written, dry_run, added, dropped, cycles, plugins_txt (Path|None)
+    """
+    empty = {"written": False, "dry_run": dry_run, "added": [], "dropped": [], "cycles": [], "plugins_txt": None}
+    info = GAMES.get(game, {})
+    plugin_exts = info.get("plugin_exts")
+    if not plugin_exts:
+        return empty
+
+    plugins_txt_path = find_plugins_txt(game)
+    if plugins_txt_path is None:
+        log.debug("plugins_txt: cannot locate Plugins.txt for %s (Proton prefix not found?)", game)
+        return {**empty, "error": "Plugins.txt location unknown — has the game been launched at least once?"}
+
+    official_masters: tuple = info.get("official_masters", ())
+    official_lower = {m.lower() for m in official_masters}
+
+    # Current state
+    parsed = _parse_plugins_txt(plugins_txt_path)
+    current_entries = {e["name"]: e["enabled"] for e in parsed["entries"]}
+
+    # Ground truth sources
+    disk_plugins = _get_disk_plugins(mod_dir, plugin_exts)
+    db_plugins: dict[str, int] = {  # plugin_name → mod_id
+        r["plugin_name"]: r["mod_id"]
+        for r in db.execute("SELECT plugin_name, mod_id FROM plugin_files WHERE game=?", (game,)).fetchall()
+    }
+
+    # Classify
+    all_known = disk_plugins | set(current_entries.keys())
+    managed: list[str] = []
+    foreign: list[str] = []
+    orphans: list[str] = []
+    for name in all_known:
+        lower = name.lower()
+        if lower in official_lower:
+            continue  # official masters handled separately
+        on_disk = name in disk_plugins
+        in_db = name in db_plugins
+        in_file = name in current_entries
+        if force_drop and name in force_drop:
+            orphans.append(name)
+        elif on_disk and in_db:
+            managed.append(name)
+        elif on_disk and not in_db:
+            foreign.append(name)
+        elif not on_disk and in_file:
+            orphans.append(name)
+
+    # Build dep graph for managed plugins
+    deps_map: dict[str, list[str]] = {}
+    for name in managed:
+        plugin_path = mod_dir / name
+        if plugin_path.exists():
+            deps_map[name] = _read_plugin_masters(plugin_path)
+
+    sorted_managed, cycles = _plugins_topo_sort(managed, deps_map)
+
+    # Official masters: preserve existing order from Plugins.txt, add any missing
+    officials_ordered = [e["name"] for e in parsed["entries"] if e["name"].lower() in official_lower]
+    for om in official_masters:
+        if om not in officials_ordered and (mod_dir / om).exists():
+            officials_ordered.append(om)
+
+    # Build final entries list: officials → sorted managed → foreign
+    final: list[dict] = []
+    for name in officials_ordered:
+        final.append({"name": name, "enabled": True})  # officials always enabled
+    for name in sorted_managed + cycles:
+        enabled = current_entries.get(name, True)  # preserve existing enabled/disabled state
+        final.append({"name": name, "enabled": enabled})
+    for name in sorted(foreign):
+        enabled = current_entries.get(name, True)
+        final.append({"name": name, "enabled": enabled})
+
+    # Detect changes
+    old_names = [e["name"] for e in parsed["entries"]]
+    new_names = [e["name"] for e in final]
+    added = [n for n in new_names if n not in set(old_names) and n.lower() not in official_lower]
+    dropped = orphans
+
+    changed = (old_names != new_names or
+               any(current_entries.get(e["name"]) != e["enabled"] for e in final))
+
+    if not changed and plugins_txt_path.exists():
+        return {**empty, "written": False, "plugins_txt": plugins_txt_path}
+
+    _write_plugins_txt(plugins_txt_path, final, dry_run=dry_run)
+    log.info("plugins_txt reconciled: +%d -%d cycles=%d path=%s",
+             len(added), len(dropped), len(cycles), plugins_txt_path)
+
+    return {
+        "written": not dry_run,
+        "dry_run": dry_run,
+        "added": added,
+        "dropped": dropped,
+        "cycles": cycles,
+        "plugins_txt": plugins_txt_path,
+        "final": final,
+    }
 
 
 # ── Profiles ─────────────────────────────────────────────────────────────────
@@ -2783,6 +3242,100 @@ def games_list():
     console.print(t)
 
 
+# search ──────────────────────────────────────────────────────────────────────
+
+@cli.command("search")
+@click.argument("game")
+@click.argument("query")
+@click.option("--count", default=10, show_default=True,
+              help="Number of results to return (1–50).")
+@click.option("--json", "as_json", is_flag=True,
+              help="Emit machine-readable JSON (sorted by endorsements desc).")
+def search_mods(game, query, count, as_json):
+    """Search Nexus Mods for mods by name (v2 GraphQL).
+
+    \b
+    Examples:
+      nexmod search darktide "enemy health"
+      nexmod search darktide "camera shake" --count 20
+      nexmod search darktide "auspex" --json
+
+    Results are sorted by endorsements (descending). Install a result with:
+      nexmod install <game> <ID>
+    """
+    if game not in GAMES:
+        console.print(f"[red]Unknown game '{game}'. Run 'nexmod games' to list supported slugs.[/red]")
+        sys.exit(1)
+
+    count = max(1, min(50, count))
+    api_key = get_api_key()
+    domain = GAMES[game]["domain"]
+
+    if not as_json:
+        console.print(f'Searching [bold]"{query}"[/bold] on {domain}…')
+
+    try:
+        nodes = api_search_mods(domain, query, api_key, count=count)
+    except RuntimeError as e:
+        console.print(f"[red]Search failed: {e}[/red]")
+        sys.exit(1)
+
+    # Sort by endorsements descending
+    nodes = sorted(nodes, key=lambda n: n.get("endorsements") or 0, reverse=True)
+
+    if as_json:
+        import json as _json
+        out = [
+            {
+                "mod_id": n.get("modId"),
+                "name": n.get("name", ""),
+                "summary": n.get("summary", "") or "",
+                "downloads": n.get("downloads") or 0,
+                "endorsements": n.get("endorsements") or 0,
+            }
+            for n in nodes
+        ]
+        click.echo(_json.dumps(out))
+        return
+
+    if not nodes:
+        console.print("[yellow]No results found.[/yellow]")
+        return
+
+    console.print(f"[dim]{len(nodes)} result(s)[/dim]\n")
+
+    def _fmt_num(n) -> str:
+        try:
+            return f"{int(n):,}"
+        except (TypeError, ValueError):
+            return "—"
+
+    def _trunc(s: str, length: int = 55) -> str:
+        if not s:
+            return ""
+        s = s.strip()
+        return s if len(s) <= length else s[:length - 1] + "…"
+
+    t = Table(show_lines=False, box=None, padding=(0, 1))
+    t.add_column("ID", style="bold cyan", no_wrap=True)
+    t.add_column("Name", style="bold", no_wrap=False)
+    t.add_column("Summary", no_wrap=False)
+    t.add_column("DL", justify="right", style="dim")
+    t.add_column("[green]✓[/green]", justify="right")
+
+    for n in nodes:
+        t.add_row(
+            str(n.get("modId") or ""),
+            n.get("name") or "",
+            _trunc(n.get("summary") or ""),
+            _fmt_num(n.get("downloads")),
+            _fmt_num(n.get("endorsements")),
+        )
+
+    console.print(t)
+    console.print(f"\n[dim]Install: nexmod install {game} <ID>[/dim]")
+
+
 # setup ───────────────────────────────────────────────────────────────────────
 
 @cli.command("setup")
@@ -2970,6 +3523,30 @@ def doctor(game):
             status(f"{slug}: mod dir exists", mod_subdir.exists(),
                    str(mod_subdir),
                    warn=not mod_subdir.exists())
+            # Darktide: check Wine (needed for dtkit-patch)
+            if slug == "darktide" and not shutil.which("wine"):
+                status(f"{slug}: wine available", False,
+                       "needed for nexmod enable/disable", warn=True)
+            # Starfield: check SFSE + Plugins.txt
+            if slug == "starfield":
+                sfse_loader = path / "sfse_loader.exe"
+                sfse_dll    = path / "sfse_steam_loader.dll"
+                sfse_ok = sfse_loader.exists() and sfse_dll.exists()
+                status(f"{slug}: SFSE installed",
+                       sfse_ok,
+                       str(sfse_loader) if sfse_ok else
+                       "run: nexmod sfse-install starfield",
+                       warn=not sfse_ok)
+                plugins_txt = find_plugins_txt(slug)
+                if plugins_txt:
+                    status(f"{slug}: plugins.txt exists",
+                           plugins_txt.exists(),
+                           str(plugins_txt) if plugins_txt.exists() else
+                           "launch the game once to create it",
+                           warn=not plugins_txt.exists())
+                else:
+                    status(f"{slug}: Proton prefix found", False,
+                           "launch the game once to create the prefix", warn=True)
         else:
             status(f"{slug}: install found", False,
                    "not installed via Steam (or different library)", warn=True)
@@ -3259,25 +3836,67 @@ def list_mods(game, as_json):
 @cli.command("info")
 @click.argument("game")
 @click.argument("mod_id", type=int)
-def show_mod_info(game, mod_id):
-    """Show detailed info for a tracked mod (local DB + one Nexus lookup).
+@click.option("--remote", is_flag=True,
+              help="Fetch info from Nexus without requiring the mod to be tracked locally.")
+def show_mod_info(game, mod_id, remote):
+    """Show detailed info for a mod (local DB + one Nexus lookup).
+
+    By default the mod must be tracked locally. Pass --remote to look up any
+    mod by ID directly from Nexus without installing or tracking it first.
 
     \b
-    Example:
+    Examples:
       nexmod info darktide 1234
+      nexmod info darktide 1234 --remote
     """
+    info_game = GAMES.get(game, {})
+    domain    = info_game.get("domain", game)
+
+    if remote:
+        # --remote path: API key required upfront; skip DB entirely.
+        api_key = get_api_key()
+        with console.status(f"Fetching mod {mod_id} from Nexus..."):
+            try:
+                upstream = api_mod_info(domain, mod_id, api_key)
+            except Exception as e:
+                log.error("info --remote: api_mod_info failed for %s/%s: %s", game, mod_id, e)
+                console.print(f"[red]Could not fetch mod {mod_id}: {e}[/red]")
+                sys.exit(1)
+
+        t = Table(title=f"Mod info (remote) — {upstream.get('name', str(mod_id))}",
+                  show_lines=False, box=None, padding=(0, 1))
+        t.add_column("Field", style="dim")
+        t.add_column("Value")
+
+        t.add_row("Game",    game)
+        t.add_row("Mod ID",  str(mod_id))
+        t.add_row("Name",    upstream.get("name") or "—")
+        if upstream.get("author"):
+            t.add_row("Author", upstream["author"])
+        if upstream.get("version"):
+            t.add_row("Latest", upstream["version"])
+        if upstream.get("summary"):
+            t.add_row("Summary", upstream["summary"])
+        t.add_row("Status", "not tracked locally")
+        t.add_row("Install", f"nexmod install {game} {mod_id}")
+
+        console.print(t)
+        return
+
     db  = get_db()
     row = db.execute(
         "SELECT * FROM mods WHERE game=? AND mod_id=?", (game, mod_id)
     ).fetchone()
     if not row:
         console.print(f"[red]Mod {mod_id} is not tracked for '{game}'.[/red]")
-        console.print(f"[dim]Run 'nexmod track {game} {mod_id}' first.[/dim]")
+        console.print(
+            f"[dim]Run 'nexmod track {game} {mod_id}' first, "
+            f"or use 'nexmod info {game} {mod_id} --remote' to look up without tracking.[/dim]"
+        )
         sys.exit(1)
 
+    # API key needed only once we know the mod is tracked.
     api_key = get_api_key()
-    info    = GAMES.get(game, {})
-    domain  = info.get("domain", game)
 
     with console.status(f"Fetching {row['name']} from Nexus..."):
         try:
@@ -3579,6 +4198,368 @@ def order_mods(game, dry_run, check, fsck, freeze, unfreeze, adopt, auto_merge):
         console.print(f"[green]✓ {lof_filename} reconciled{suffix}.[/green]")
     else:
         console.print("[dim]Load order is already in canonical form.[/dim]")
+
+
+# plugins / plugin-enable / plugin-disable / plugin-order ────────────────────
+
+@cli.command("plugins")
+@click.argument("game")
+@click.option("--json", "output_json", is_flag=True, help="Output JSON array")
+def list_plugins(game, output_json):
+    """List plugins tracked in Plugins.txt for a Bethesda game (Starfield, etc.)."""
+    info = GAMES.get(game, {})
+    if not info.get("plugin_exts"):
+        console.print(f"[red]{game} does not use a plugin load order.[/red]")
+        sys.exit(1)
+
+    plugins_txt_path = find_plugins_txt(game)
+    if plugins_txt_path is None or not plugins_txt_path.exists():
+        console.print(f"[yellow]Plugins.txt not found.[/yellow] Has {game} been launched at least once?")
+        console.print(f"  Expected: {plugins_txt_path or '(Proton prefix not found)'}")
+        sys.exit(1)
+
+    db = get_db()
+    parsed = _parse_plugins_txt(plugins_txt_path)
+    db_plugins = {
+        r["plugin_name"]: r["mod_id"]
+        for r in db.execute("SELECT plugin_name, mod_id FROM plugin_files WHERE game=?", (game,)).fetchall()
+    }
+    official_lower = {m.lower() for m in info.get("official_masters", ())}
+    mod_dir = resolve_mod_dir(game, db)
+
+    if output_json:
+        out = []
+        for e in parsed["entries"]:
+            out.append({
+                "name": e["name"],
+                "enabled": e["enabled"],
+                "type": "official" if e["name"].lower() in official_lower else (
+                    "managed" if e["name"] in db_plugins else "foreign"
+                ),
+                "mod_id": db_plugins.get(e["name"]),
+                "on_disk": (mod_dir / e["name"]).exists(),
+                "masters": _read_plugin_masters(mod_dir / e["name"]) if (mod_dir / e["name"]).exists() else [],
+            })
+        import json as _json
+        console.print(_json.dumps(out, indent=2))
+        return
+
+    t = Table(title=f"Plugins.txt — {info.get('name', game)}", show_header=True, header_style="bold")
+    t.add_column("#", style="dim", width=4)
+    t.add_column("Plugin", style="cyan")
+    t.add_column("State", width=8)
+    t.add_column("Type", width=10)
+    t.add_column("Masters (deps)", style="dim")
+
+    for i, e in enumerate(parsed["entries"], 1):
+        name = e["name"]
+        state = "[green]enabled[/green]" if e["enabled"] else "[red]disabled[/red]"
+        if name.lower() in official_lower:
+            typ = "[dim]official[/dim]"
+        elif name in db_plugins:
+            typ = "[blue]managed[/blue]"
+        else:
+            typ = "[yellow]foreign[/yellow]"
+        plugin_path = mod_dir / name
+        masters = _read_plugin_masters(plugin_path) if plugin_path.exists() else []
+        non_official_masters = [m for m in masters if m.lower() not in official_lower]
+        deps_str = ", ".join(non_official_masters) if non_official_masters else ""
+        t.add_row(str(i), name, state, typ, deps_str)
+
+    console.print(t)
+    console.print(f"[dim]Plugins.txt: {plugins_txt_path}[/dim]")
+
+
+@cli.command("plugin-enable")
+@click.argument("game")
+@click.argument("plugin_name")
+def plugin_enable(game, plugin_name):
+    """Enable a plugin in Plugins.txt."""
+    info = GAMES.get(game, {})
+    if not info.get("plugin_exts"):
+        console.print(f"[red]{game} does not use a plugin load order.[/red]")
+        sys.exit(1)
+    plugins_txt_path = find_plugins_txt(game)
+    if not plugins_txt_path or not plugins_txt_path.exists():
+        console.print("[red]Plugins.txt not found.[/red]")
+        sys.exit(1)
+    parsed = _parse_plugins_txt(plugins_txt_path)
+    found = False
+    for e in parsed["entries"]:
+        if e["name"].lower() == plugin_name.lower():
+            e["enabled"] = True
+            found = True
+            break
+    if not found:
+        console.print(f"[red]{plugin_name} not found in Plugins.txt.[/red]")
+        sys.exit(1)
+    _write_plugins_txt(plugins_txt_path, parsed["entries"])
+    console.print(f"[green]Enabled:[/green] {plugin_name}")
+
+
+@cli.command("plugin-disable")
+@click.argument("game")
+@click.argument("plugin_name")
+def plugin_disable(game, plugin_name):
+    """Disable a plugin in Plugins.txt (keeps it in the file but won't load)."""
+    info = GAMES.get(game, {})
+    if not info.get("plugin_exts"):
+        console.print(f"[red]{game} does not use a plugin load order.[/red]")
+        sys.exit(1)
+    official_lower = {m.lower() for m in info.get("official_masters", ())}
+    if plugin_name.lower() in official_lower:
+        console.print(f"[red]{plugin_name} is an official master — cannot disable.[/red]")
+        sys.exit(1)
+    plugins_txt_path = find_plugins_txt(game)
+    if not plugins_txt_path or not plugins_txt_path.exists():
+        console.print("[red]Plugins.txt not found.[/red]")
+        sys.exit(1)
+    parsed = _parse_plugins_txt(plugins_txt_path)
+    found = False
+    for e in parsed["entries"]:
+        if e["name"].lower() == plugin_name.lower():
+            e["enabled"] = False
+            found = True
+            break
+    if not found:
+        console.print(f"[red]{plugin_name} not found in Plugins.txt.[/red]")
+        sys.exit(1)
+    _write_plugins_txt(plugins_txt_path, parsed["entries"])
+    console.print(f"[yellow]Disabled:[/yellow] {plugin_name}")
+
+
+@cli.command("plugin-order")
+@click.argument("game")
+@click.option("--dry-run", is_flag=True, help="Show proposed order without writing")
+@click.option("--check", is_flag=True, help="Show classification table and diff, don't write")
+def plugin_order(game, dry_run, check):
+    """Reconcile and dependency-sort Plugins.txt for a Bethesda game.
+
+    \b
+    Classification:
+      official  – game master files, always first, never reordered
+      managed   – tracked by nexmod, dependency-sorted
+      foreign   – on disk but not tracked, appended at end
+      orphan    – in Plugins.txt but missing from disk, dropped
+    """
+    info = GAMES.get(game, {})
+    if not info.get("plugin_exts"):
+        console.print(f"[red]{game} does not use a plugin load order.[/red]")
+        sys.exit(1)
+
+    db = get_db()
+    mod_dir = resolve_mod_dir(game, db)
+    plugins_txt_path = find_plugins_txt(game)
+
+    if plugins_txt_path is None:
+        console.print("[red]Cannot locate Plugins.txt (Proton prefix not found).[/red]")
+        console.print("  Launch the game at least once, then retry.")
+        sys.exit(1)
+
+    if check or dry_run:
+        result = reconcile_plugins_txt(game, db, mod_dir, dry_run=True)
+        if result.get("error"):
+            console.print(f"[red]{result['error']}[/red]")
+            sys.exit(1)
+
+        # Show classification table
+        parsed_before = _parse_plugins_txt(plugins_txt_path)
+        official_lower = {m.lower() for m in info.get("official_masters", ())}
+        db_plugins = {
+            r["plugin_name"] for r in
+            db.execute("SELECT plugin_name FROM plugin_files WHERE game=?", (game,)).fetchall()
+        }
+        disk_plugins = _get_disk_plugins(mod_dir, info["plugin_exts"])
+
+        if check:
+            t = Table(title="Plugin classification", show_header=True, header_style="bold")
+            t.add_column("Plugin", style="cyan")
+            t.add_column("Class", width=10)
+            t.add_column("On Disk", width=8)
+            t.add_column("In DB", width=7)
+            t.add_column("In File", width=7)
+            all_names = {e["name"] for e in parsed_before["entries"]} | disk_plugins
+            for name in sorted(all_names):
+                lower = name.lower()
+                on_disk = name in disk_plugins
+                in_db = name in db_plugins
+                in_file = any(e["name"] == name for e in parsed_before["entries"])
+                if lower in official_lower:
+                    cls = "[dim]official[/dim]"
+                elif on_disk and in_db:
+                    cls = "[blue]managed[/blue]"
+                elif on_disk and not in_db:
+                    cls = "[yellow]foreign[/yellow]"
+                elif not on_disk and in_file:
+                    cls = "[red]orphan[/red]"
+                else:
+                    cls = "[dim]unknown[/dim]"
+                t.add_row(name, cls,
+                          "[green]yes[/green]" if on_disk else "[red]no[/red]",
+                          "[green]yes[/green]" if in_db else "no",
+                          "[green]yes[/green]" if in_file else "no")
+            console.print(t)
+
+        # Show diff
+        old_names = [e["name"] for e in parsed_before["entries"]]
+        new_names = [e["name"] for e in result.get("final", [])]
+        if old_names != new_names:
+            diff = list(difflib.unified_diff(
+                [n + "\n" for n in old_names],
+                [n + "\n" for n in new_names],
+                fromfile="current", tofile="proposed", lineterm=""
+            ))
+            if diff:
+                console.print("\n[bold]Proposed changes:[/bold]")
+                for line in diff:
+                    if line.startswith("+") and not line.startswith("+++"):
+                        console.print(f"[green]{line}[/green]")
+                    elif line.startswith("-") and not line.startswith("---"):
+                        console.print(f"[red]{line}[/red]")
+                    else:
+                        console.print(f"[dim]{line}[/dim]")
+        else:
+            console.print("[dim]No changes needed.[/dim]")
+        return
+
+    result = reconcile_plugins_txt(game, db, mod_dir)
+    if result.get("error"):
+        console.print(f"[red]{result['error']}[/red]")
+        sys.exit(1)
+    if result["written"]:
+        msgs = []
+        if result["added"]:
+            msgs.append(f"+{len(result['added'])} added")
+        if result["dropped"]:
+            msgs.append(f"-{len(result['dropped'])} dropped")
+        if result["cycles"]:
+            msgs.append(f"{len(result['cycles'])} cycles")
+        console.print(f"[green]✓ Plugins.txt reconciled[/green]" +
+                      (f" ({', '.join(msgs)})" if msgs else ""))
+        if result["cycles"]:
+            console.print(f"  [yellow]Dependency cycles: {', '.join(result['cycles'])}[/yellow]")
+    else:
+        console.print("[dim]Plugins.txt already up to date.[/dim]")
+
+
+# sfse-install ────────────────────────────────────────────────────────────────
+
+SFSE_NEXUS_MOD_ID = 106
+SFSE_STEAM_LAUNCH_OPTION = "bash -c 'exec \"${@/Starfield.exe/sfse_loader.exe}\"' -- %command%"
+
+@cli.command("sfse-install")
+@click.argument("game", default="starfield")
+@click.option("--from-file", "from_file", type=click.Path(path_type=Path), default=None,
+              help="Install from a local SFSE archive instead of downloading.")
+@click.option("--dry-run", is_flag=True, help="Show what would be installed, don't extract.")
+def sfse_install(game, from_file, dry_run):
+    """Install Starfield Script Extender (SFSE) to the game root directory.
+
+    \b
+    SFSE files go to the game root (alongside Starfield.exe), not Data/.
+    After installation, set this Steam launch option on Starfield:
+
+      bash -c 'exec "${@/Starfield.exe/sfse_loader.exe}"' -- %command%
+
+    Nexus Premium: downloads SFSE (mod 106) automatically.
+    Free account:  download the archive from nexusmods.com/starfield/mods/106
+                   and pass it with --from-file <archive>.
+
+    Note: the 'Plugins.txt Enabler' mod is NOT needed — Bethesda added native
+    plugins.txt support in patch 1.12.30 (June 2024).
+    """
+    if game != "starfield":
+        console.print(f"[red]sfse-install only supports Starfield (got: {game})[/red]")
+        sys.exit(1)
+
+    info = GAMES["starfield"]
+    db = get_db()
+
+    # Resolve game root (parent of Data/)
+    try:
+        mod_dir  = resolve_mod_dir(game, db)
+        game_root = mod_dir.parent
+    except SystemExit:
+        console.print("[red]Starfield install not found. Run: nexmod doctor starfield[/red]")
+        sys.exit(1)
+
+    api_key = get_api_key()
+    domain  = info["domain"]
+
+    # Fetch mod metadata so we know the file to download
+    with console.status("Fetching SFSE metadata..."):
+        mod   = api_mod_info(domain, SFSE_NEXUS_MOD_ID, api_key)
+        files = api_mod_files(domain, SFSE_NEXUS_MOD_ID, api_key)
+
+    console.print(f"  [bold]{mod['name']}[/bold] v{mod.get('version', '?')}")
+
+    chosen = pick_main_file(files)
+    if not chosen:
+        console.print("[red]Could not determine main file. Use --from-file.[/red]")
+        for f in files:
+            console.print(f"  [{f['file_id']}] {f['file_name']} ({f.get('category_name')})")
+        sys.exit(1)
+
+    if dry_run:
+        console.print(f"\n[bold](dry-run) Would install to:[/bold] {game_root}")
+        console.print(f"  File: {chosen['file_name']} ({chosen.get('size_kb', '?')} KB)")
+        console.print(f"  Target: {game_root}/sfse_loader.exe  +  sfse_steam_loader.dll  +  versioned DLL")
+        console.print(f"\n[bold]After installation, set this Steam launch option:[/bold]")
+        console.print(f"  [cyan]{SFSE_STEAM_LAUNCH_OPTION}[/cyan]")
+        return
+
+    if from_file:
+        archive = from_file.resolve()
+        if not archive.exists():
+            console.print(f"[red]File not found: {archive}[/red]")
+            sys.exit(1)
+        console.print(f"  Installing from local file: [dim]{archive}[/dim]")
+        _do_sfse_extract(archive, game_root, own_archive=False)
+    else:
+        with console.status("Getting CDN download link..."):
+            urls = api_download_urls(domain, SFSE_NEXUS_MOD_ID, chosen["file_id"], api_key)
+        if not urls:
+            console.print(
+                "[red]Direct download requires Premium.[/red]\n"
+                "  Download from [cyan]nexusmods.com/starfield/mods/106[/cyan] "
+                "and use [cyan]--from-file <archive>[/cyan]."
+            )
+            sys.exit(1)
+
+        tmp = DATA_DIR / "tmp"
+        tmp.mkdir(parents=True, exist_ok=True)
+        archive = tmp / chosen["file_name"]
+        try:
+            _try_download_with_mirrors(urls, archive)
+            _do_sfse_extract(archive, game_root, own_archive=True)
+        finally:
+            archive.unlink(missing_ok=True)
+
+    # Verify key files landed
+    sfse_loader = game_root / "sfse_loader.exe"
+    sfse_dll    = game_root / "sfse_steam_loader.dll"
+    if sfse_loader.exists() and sfse_dll.exists():
+        console.print(f"\n[green]✓ SFSE installed to {game_root}[/green]")
+    else:
+        console.print(f"\n[yellow]⚠ Installation complete but sfse_loader.exe not found at {game_root}.[/yellow]")
+        console.print("  The archive may have a different layout. Check manually.")
+
+    console.print(f"\n[bold]Next: set this Steam launch option on Starfield:[/bold]")
+    console.print(f"  [cyan]{SFSE_STEAM_LAUNCH_OPTION}[/cyan]")
+    console.print("\n[dim]Right-click Starfield → Properties → General → Launch Options[/dim]")
+    console.print("[dim]Note: 'Plugins.txt Enabler' is NOT needed — Bethesda added native support in patch 1.12.30.[/dim]")
+
+
+def _do_sfse_extract(archive: Path, game_root: Path, own_archive: bool) -> None:
+    """Extract SFSE archive, placing root-level files into game_root.
+
+    SFSE archives typically contain files at the root level (sfse_loader.exe,
+    sfse_steam_loader.dll, etc.) and optionally a Data/ subtree. Root-level
+    files and Data/ both land correctly when extracted to game_root.
+    """
+    console.print(f"  Extracting to [dim]{game_root}[/dim]...")
+    extract_archive(archive, game_root)
+    log.info("SFSE extracted to %s", game_root)
 
 
 # pin / unpin ─────────────────────────────────────────────────────────────────
@@ -3964,6 +4945,17 @@ def remove_mod(game, mod_id, purge, yes, force_legacy_purge, dry_run):
         console.print(f"[dim](dry-run) Would untrack {row['name']} (mod_id={mod_id})[/dim]")
         return
 
+    # Remove plugin_files rows before deleting the mod (for Bethesda games)
+    info = GAMES.get(game) or {}
+    removed_plugins = []
+    if info.get("plugin_exts"):
+        removed_plugins = [
+            r["plugin_name"] for r in
+            db.execute("SELECT plugin_name FROM plugin_files WHERE game=? AND mod_id=?",
+                       (game, mod_id)).fetchall()
+        ]
+        db.execute("DELETE FROM plugin_files WHERE game=? AND mod_id=?", (game, mod_id))
+
     db.execute("DELETE FROM mods WHERE game=? AND mod_id=?", (game, mod_id))
     db.commit()
     record(db, "remove", game, mod_id, row["name"], row["version"], "ok")
@@ -3973,7 +4965,6 @@ def remove_mod(game, mod_id, purge, yes, force_legacy_purge, dry_run):
     # auto-adds discovered framework folders, topo-sorts.
     # force_drop ensures the removed mod's folder is treated as an orphan even
     # if its files are still on disk (files-on-disk → "foreign" → kept otherwise).
-    info = GAMES.get(game) or {}
     if info.get("load_order_file") and row["mod_dir"]:
         removed_folder = row["folder_name"] or None
         try:
@@ -3992,6 +4983,19 @@ def remove_mod(game, mod_id, purge, yes, force_legacy_purge, dry_run):
         except Exception as e:
             log.warning("reconcile after remove failed: %s", e)
             console.print(f"[yellow]Load order reconcile failed: {e}[/yellow]")
+
+    # Bethesda: reconcile Plugins.txt — removed plugins become orphans → dropped
+    if removed_plugins and row["mod_dir"]:
+        try:
+            result = reconcile_plugins_txt(
+                game, db, Path(row["mod_dir"]),
+                force_drop=set(removed_plugins),
+            )
+            if result.get("dropped"):
+                console.print(f"[dim]Plugins.txt: removed {', '.join(result['dropped'])}[/dim]")
+        except Exception as e:
+            log.warning("plugins.txt reconcile after remove failed: %s", e)
+            console.print(f"[yellow]Plugins.txt update failed: {e}[/yellow]")
 
 
 # uninstall ───────────────────────────────────────────────────────────────────

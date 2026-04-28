@@ -8,18 +8,61 @@ All notable changes to nexmod are documented here. Format follows
 
 ## [Unreleased]
 
+---
+
+## [0.9.0] — LLM-first public launch
+
+Public launch release. Built on the hardening work in 0.3.0, this version adds
+search, remote mod inspection, and first-run setup — the features that make
+nexmod practical both for players and for LLM agents scripting mod management.
+The thesis: a mod manager that speaks JSON and can be driven entirely from the
+command line, including by automation.
+
 ### Added
 
-- `nexmod setup` — interactive first-run wizard: prompts for API key, auto-scans Steam for all supported games (or a single `--game <slug>`), and runs `doctor` to confirm the environment. Use `--reset` to re-enter an existing key.
-- Interactive game path prompt on unknown or undetected games in `resolve_mod_dir`: when stdin/stdout are TTYs, nexmod prompts the user to enter a path instead of exiting immediately. Non-interactive callers (cron, scripts, pipes) still get a hard exit with a clear `nexmod path set` hint.
-- Inline dep install prompt in `--fix-deps`: a `[Y/n]` gate now appears before each missing dep, and the DB is queried by `folder_name` before prompting for a URL — known mods install directly without requiring a Nexus URL.
-- `nexmod check <game> --json` — machine-readable staleness check; emits one object per mod with `mod_id`, `installed`, `latest`, `update_available`, `error`
-- `nexmod update <game> --json` — machine-readable update run; implies `--yes`; emits `updated`/`current`/`failed`/`load_order` summary object
-- `doctor` now prints a "→ Next:" hint after a clean pass
+- `nexmod search <game> <query>` — search Nexus Mods for mods by name using
+  the v2 GraphQL API; results sorted by endorsements descending; supports
+  `--count N` (1–50, default 10) and `--json` for machine-readable output.
+  Enables LLMs and scripts to discover mod IDs without leaving the terminal.
+- `nexmod info <game> <mod_id> --remote` — fetch mod info from Nexus without
+  requiring the mod to be tracked locally; useful for inspecting a mod before
+  deciding to install it. Works without local state.
+- `nexmod setup` — interactive first-run wizard: prompts for API key, auto-scans
+  Steam for all supported games (or a single `--game <slug>`), and runs `doctor`
+  to confirm the environment. `--reset` re-enters an existing key.
+- Interactive game path prompt on unknown or undetected games in
+  `resolve_mod_dir`: when stdin/stdout are TTYs, nexmod prompts the user to
+  enter a path instead of exiting immediately. Non-interactive callers (cron,
+  scripts, pipes) still get a hard exit with a clear `nexmod path set` hint.
+- Inline dep install prompt in `--fix-deps`: a `[Y/n]` gate now appears before
+  each missing dep; the DB is queried by `folder_name` before prompting for a
+  URL — known mods install directly without requiring a Nexus URL.
+- `nexmod check <game> --json` — machine-readable staleness check; emits one
+  object per mod with `mod_id`, `installed`, `latest`, `update_available`,
+  `error`. Structured output for automation and LLM pipelines.
+- `nexmod update <game> --json` — machine-readable update run; implies `--yes`;
+  emits `updated`/`current`/`failed`/`load_order` summary object.
+- `doctor` now prints a "→ Next:" hint after a clean pass, guiding first-time
+  users to the next step.
 
 ### Fixed
 
-- README "From source" install used `pip install -e . --user`; corrected to `pip install -e ".[dev]"` so dev dependencies (pytest, responses) are included
+- README "From source" install used `pip install -e . --user`; corrected to
+  `pip install -e ".[dev]"` so dev dependencies (pytest, responses) are
+  included when installing for development.
+
+### Internal
+
+- 430 tests, 0.84s runtime. New test files added this cycle:
+  - `tests/test_darktide_actions.py` — 149 tests across 18 test classes covering
+    the full Darktide user journey end-to-end (install, enable/disable, order,
+    pins, profiles, rollback, history, diag, nxm, search).
+  - `tests/test_search.py` — 30 tests for `nexmod search` (v2 GraphQL) and
+    `nexmod info --remote` (API lookup without local tracking).
+- Nexus API v2 GraphQL search uses `nameStemmed` + WILDCARD `*query*` — not
+  `name` — which returns zero hits. Endpoint not Premium-gated.
+- `info --remote` defers `get_api_key()` to the latest possible moment so
+  untracked-mod errors surface before any API interaction.
 
 ---
 

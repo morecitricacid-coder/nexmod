@@ -107,7 +107,8 @@ def test_nxm_dispatches_to_do_install(runner, monkeypatch):
     nexmod.CONFIG_FILE.write_text(_json.dumps({"api_key": "OK"}))
     captured = {}
 
-    def fake_install(game, mod_id, file_id, api_key, db):
+    def fake_install(game, mod_id, file_id, api_key, db, *,
+                     nxm_key=None, nxm_expires=None, nxm_user_id=None, from_file=None):
         captured["game"]    = game
         captured["mod_id"]  = mod_id
         captured["file_id"] = file_id

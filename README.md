@@ -98,10 +98,17 @@ nexmod doctor
 #     button on Nexus mod pages launches nexmod automatically.
 nexmod nxm-register
 
-# 4a. Install by URL (any Nexus mod page works)
+# 4a. Search for a mod by name before installing
+nexmod search darktide "enemy health"
+nexmod search darktide "camera shake" --json   # machine-readable for scripting
+
+# 4b. Look up details on a mod ID before committing to install
+nexmod info darktide 1234 --remote
+
+# 4c. Install by URL (any Nexus mod page works)
 nexmod install https://www.nexusmods.com/warhammer40kdarktide/mods/1234
 
-# 4b. Or by slug + ID
+# 4d. Or by slug + ID (found via search)
 nexmod install darktide 1234
 
 # 5. List, check, update
@@ -149,12 +156,13 @@ nexmod profile load darktide full        # back to full
 | `nexmod check <game>` | — | Show installed-vs-latest for every tracked mod (no download). |
 | `nexmod update <game>` | `--mod-id N`, `-y/--yes`, `--no-reorder`, `--fix-deps` | Download and apply available updates, then scan for missing deps. Reports gaps by default; `--fix-deps` prompts to install each. The dep scan runs **even when nothing was updated** so silent rot is impossible. |
 
-### Listing & inspection
+### Discovery & listing
 
 | Command | Flags | Description |
 |---------|-------|-------------|
+| `nexmod search <game> <query>` | `--count N` (1–50, default 10), `--json` | Search Nexus Mods for mods by name (v2 GraphQL). Results sorted by endorsements. `--json` emits machine-readable JSON; useful for LLM / scripting workflows. |
 | `nexmod list <game>` | `--json` | Tracked mods. `--json` emits machine-readable rows. |
-| `nexmod info <game> <mod_id>` | — | Local DB row + one Nexus call: author, version, deps, install date. |
+| `nexmod info <game> <mod_id>` | `--remote` | Local DB row + one Nexus call: author, version, deps, install date. `--remote` fetches from Nexus without requiring the mod to be tracked — useful before installing. |
 | `nexmod history [game]` | `--limit N`, `--failures` | Operation history. |
 | `nexmod logs` | `--lines N`, `--errors`, `--follow` | Tail nexmod's own log. |
 | `nexmod games` | — | List built-in game slugs. |
@@ -399,11 +407,16 @@ The SQLite DB is safe to read concurrently while nexmod is running — WAL is en
 | Category | Commands |
 |----------|----------|
 | **Read-only, no network, no API key** | `list`, `list --json`, `history`, `logs`, `path show`, `games`, `profile list`, `profile show`, `config show`, `snapshots`, `fsck`, `rollback --list` |
-| **Network / API key required** | `install`, `track`, `update`, `check`, `scan`, `info`, `config verify`, `doctor`, `nxm`, `fsck --with-api` |
+| **Network / API key required** | `search`, `install`, `track`, `update`, `check`, `scan`, `info`, `info --remote`, `config verify`, `doctor`, `nxm`, `fsck --with-api` |
 
 ### JSON output
 
-Three commands emit machine-readable JSON when passed `--json`:
+Four commands emit machine-readable JSON when passed `--json`:
+
+**`nexmod search <game> <query> --json`** — search results sorted by endorsements:
+```json
+[{"mod_id":1234,"name":"Enemy Health Bars","summary":"Shows enemy HP above heads.","downloads":50123,"endorsements":1234}]
+```
 
 **`nexmod list <game> --json`** — full DB row per tracked mod:
 ```json
@@ -491,6 +504,99 @@ Manage pins via `nexmod pin` / `nexmod unpin` / `nexmod pins <game>` rather than
   - Arch: `sudo pacman -S p7zip`
   - Fedora: `sudo dnf install p7zip p7zip-plugins`
 - Wine — only required for Darktide `enable` / `disable` / `toggle`.
+
+---
+
+## Contributing
+
+nexmod is a public project. Bug reports, game additions, and fixes are welcome.
+
+### Bug reports
+
+Open an issue at [github.com/morecitricacid-coder/nexmod/issues](https://github.com/morecitricacid-coder/nexmod/issues).
+
+Include:
+- OS and distro (e.g. Ubuntu 24.04, Arch Linux)
+- Python version: `python3 --version`
+- nexmod version: `nexmod --version`
+- The full command you ran
+- The complete error output
+- Game slug (e.g. `darktide`, `skyrimse`)
+
+### Feature requests
+
+Same link as above, label: **enhancement**. Game support requests are especially welcome — include the mod directory path and the Nexus domain slug (from the URL: `nexusmods.com/<domain>/mods/...`).
+
+### Submitting a fix (pull requests)
+
+A *fork* is your personal copy of the project on GitHub. You make changes in your copy, then open a pull request to propose merging them back into nexmod. GitHub handles all the mechanics; you just need a GitHub account and basic git familiarity.
+
+1. Fork the repo on GitHub (big **Fork** button, top right of the repo page)
+2. Clone your fork locally:
+   ```bash
+   git clone https://github.com/<your-username>/nexmod && cd nexmod
+   ```
+3. Create a branch for your change:
+   ```bash
+   git checkout -b fix/my-fix
+   ```
+4. Install dev dependencies:
+   ```bash
+   pip install -e ".[dev]"
+   ```
+5. Make your change, then run the test suite:
+   ```bash
+   pytest -q -m "not smoke"
+   ```
+6. Push your branch:
+   ```bash
+   git push origin fix/my-fix
+   ```
+7. Open a pull request from your branch to `morecitricacid-coder/nexmod:main` on GitHub
+
+**PR guidelines:**
+- One fix per PR — keeps review focused
+- Add a test if you're fixing a bug (helps catch regressions later)
+- Update README and CHANGELOG `[Unreleased]` if the user-facing surface changes
+- CI must be green before merge
+
+### Adding a new game
+
+If your game is on Nexus Mods and runs on Linux, it can probably be added in a few lines of code.
+
+**What you need to find:**
+- The game's Nexus domain — from the URL: `nexusmods.com/<domain>/mods/...`
+- The Steam app ID — from the store URL: `store.steampowered.com/app/<id>/`
+- Where mods live on disk — install one mod with Vortex or manually, then find the folder relative to the game's install directory
+
+**How to add it:**
+
+1. Open `nexmod.py` and find the `GAMES` dict near the top
+2. Add your entry:
+   ```python
+   "mygame": {
+       "name": "My Game Full Name",
+       "domain": "mygame",      # from nexusmods.com/<domain>/mods/...
+       "steam_id": 123456,      # from store.steampowered.com/app/<id>/
+       "mod_subdir": "Mods",    # relative to game install dir; case-sensitive on Linux
+       "log_subpath": None,     # relative path to game log file, or None
+   },
+   ```
+   > Note: only add `load_order_file` if the game uses a plain-text mod list (like Darktide's `mod_load_order.txt`). Most games don't.
+3. Verify it shows up: `nexmod games`
+4. Test the basics: `nexmod doctor mygame` and `nexmod install mygame <any-mod-id>`
+5. Add your game to the Supported Games table in README.md
+6. Open a PR with your findings
+
+### Integrating nexmod with other tools
+
+**As a library** — nexmod is intentionally a single-file CLI, not a Python library. Call it as a subprocess rather than importing it. The `--json` flags give you structured output, and the SQLite DB at `~/.local/share/nexmod/mods.db` is WAL-mode safe to read concurrently.
+
+**From an LLM agent** — see the [For Automation / LLMs](#for-automation--llms) section above for the full JSON contract. Primary read paths: `nexmod search --json`, `nexmod list --json`, `nexmod check --json`. Primary write paths: `nexmod install`, `nexmod update --yes --json`. The DB is always safe to query directly for read-only access.
+
+**In a shell script** — all commands exit `0` on success, `1` on failure. `--yes` and `--json` skip prompts. Idempotent commands: `track`, `scan`, `path set`, `fsck --fix`, `nxm-register`.
+
+**Reporting nexmod issues from tool integrations** — include the full subprocess call and captured stderr in your bug report.
 
 ---
 
