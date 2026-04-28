@@ -962,6 +962,16 @@ def extract_archive(archive: Path, target_dir: Path):
                     "  Fedora:        sudo dnf install p7zip p7zip-plugins\n"
                     "  openSUSE:      sudo zypper install p7zip"
                 )
+            # Path-traversal check: list contents first and reject any unsafe member.
+            list_result = subprocess.run(
+                [_7z, "l", "-slt", str(archive)],
+                capture_output=True, text=True,
+            )
+            for line in list_result.stdout.splitlines():
+                if line.startswith("Path = "):
+                    mpath = line[7:].strip()
+                    if os.path.isabs(mpath) or ".." in mpath.replace("\\", "/").split("/"):
+                        raise RuntimeError(f"Unsafe path in archive: {mpath}")
             result = subprocess.run(
                 [_7z, "x", str(archive), f"-o{target_dir}", "-y"],
                 capture_output=True, text=True,

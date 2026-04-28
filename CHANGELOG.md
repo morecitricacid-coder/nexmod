@@ -8,6 +8,9 @@ All notable changes to nexmod are documented here. Format follows
 
 ## [Unreleased]
 
+### Fixed
+- **Security:** `.7z` archives now have path-traversal protection — contents are listed via `7z l -slt` before extraction; any member with an absolute path or `..` component raises `RuntimeError`. Zip and tar already had this check; `.7z` was the gap.
+
 ---
 
 ## [0.9.0] — LLM-first public launch

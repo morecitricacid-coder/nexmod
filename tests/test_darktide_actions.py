@@ -1737,6 +1737,32 @@ class TestSafetyGuards:
         evil = Path("/") / "evil.sh"
         assert not evil.exists()  # guard: path traversal didn't escape
 
+    def test_7z_rejects_path_traversal(self, tmp_path, monkeypatch):
+        """extract_archive rejects .7z archives whose listing contains ../  paths."""
+        import subprocess as _sp
+        fake_archive = tmp_path / "evil.7z"
+        fake_archive.touch()
+
+        evil_listing = (
+            "----------\nPath = ../../../evil.sh\nSize = 10\n"
+        )
+
+        def fake_run(cmd, **kw):
+            m = MagicMock()
+            if "l" in cmd:
+                m.returncode = 0
+                m.stdout = evil_listing
+            else:
+                m.returncode = 0
+                m.stdout = ""
+            return m
+
+        monkeypatch.setattr(_sp, "run", fake_run)
+        monkeypatch.setattr(nexmod.shutil, "which", lambda x: "/usr/bin/7z")
+
+        with pytest.raises(RuntimeError, match="Unsafe path"):
+            nexmod.extract_archive(fake_archive, tmp_path / "out")
+
     def test_remove_purge_requires_confirmation(self, runner, darktide_mod_dir):
         """remove --purge without --yes prompts the user."""
         folder = darktide_mod_dir / "MyMod"
