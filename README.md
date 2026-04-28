@@ -493,6 +493,55 @@ Place these as comments in `mod_load_order.txt` to control reconcile behavior:
 
 Manage pins via `nexmod pin` / `nexmod unpin` / `nexmod pins <game>` rather than editing the file manually.
 
+### MCP Server (Claude / LLM integration)
+
+nexmod ships an optional MCP server so LLMs can manage your mods natively — no CLI syntax needed, just typed tool calls.
+
+**Install:**
+```bash
+pip install nexmod[mcp]
+```
+
+**Add to Claude Code:**
+```bash
+claude mcp add nexmod -- nexmod mcp-server
+```
+
+Or add manually to `~/.claude.json`:
+```json
+{
+  "mcpServers": {
+    "nexmod": {
+      "command": "nexmod",
+      "args": ["mcp-server"]
+    }
+  }
+}
+```
+
+**Available tools (12):**
+
+| Tool | Description |
+|------|-------------|
+| `games()` | List all supported games |
+| `search_mods(game, query, count)` | Search Nexus Mods by name |
+| `list_mods(game)` | List installed/tracked mods |
+| `mod_info(game, mod_id)` | Detailed mod info from Nexus |
+| `install_mod(game, mod_id)` | Download and install a mod |
+| `check_updates(game)` | Check for available updates |
+| `update_mod(game, mod_id)` | Update a mod to latest version |
+| `remove_mod(game, mod_id, purge)` | Remove a tracked mod |
+| `get_history(game, limit)` | Install/update history |
+| `list_profiles(game)` | List saved profiles |
+| `save_profile(game, name)` | Save current load order as profile |
+| `load_profile(game, name)` | Apply a saved profile |
+
+**Example Claude session:**
+> "What Darktide mods do I have installed?"
+> *calls `list_mods("darktide")`*
+> "Check for updates and install any that are available."
+> *calls `check_updates("darktide")` then `update_mod` for each stale entry*
+
 ---
 
 ## Requirements

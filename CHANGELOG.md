@@ -8,7 +8,22 @@ All notable changes to nexmod are documented here. Format follows
 
 ## [Unreleased]
 
+---
+
+## [1.0.0] — First stable release — 2026-04-28
+
+First stable release. All critical features shipped, tested, and documented.
+The install/update/rollback pipeline works end-to-end on a clean Linux machine.
+This version also adds native LLM/Claude integration via an MCP server, making
+nexmod the first Linux mod manager with typed tool-call support.
+
 ### Added
+- **MCP server** (`nexmod mcp-server`): optional native LLM integration via the
+  [Model Context Protocol](https://modelcontextprotocol.io/). Exposes 12 typed tools
+  (`games`, `search_mods`, `list_mods`, `mod_info`, `install_mod`, `check_updates`,
+  `update_mod`, `remove_mod`, `get_history`, `list_profiles`, `save_profile`,
+  `load_profile`). Install: `pip install nexmod[mcp]`. Add to Claude Code:
+  `claude mcp add nexmod -- nexmod mcp-server`.
 - `nexmod history` now accepts `--json` / `-j` flag; emits a JSON array of history records for programmatic consumption by LLM agents and scripts.
 - `nexmod search` now shows an `Inst.` column (human table) and `"installed": bool` field (JSON) indicating whether each result is already tracked in the local DB.
 - `nexmod profile save` now embeds a `"mods"` list in the saved profile JSON — each entry records `mod_id`, `name`, `version`, `folder_name`, and `domain`. Allows `profile load --install` to re-download mods on a clean machine without needing a pre-existing DB.
@@ -25,6 +40,7 @@ All notable changes to nexmod are documented here. Format follows
 
 ### Notes
 - Flatpak Steam users: `nexmod nxm-register` now prints a warning when `~/.var/app/com.valvesoftware.Steam` is detected, explaining that Flatpak browser isolation may prevent NXM link dispatch and providing a manual workaround.
+- Internal: schema migration 003 adds `plugin_files` table for Starfield plugin tracking.
 
 ---
 

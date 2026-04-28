@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "nexmod"
-version = "0.9.0"
+version = "1.0.0"
 description = "Linux-native CLI mod manager for Nexus Mods (requires Premium)"
 readme = "README.md"
 license = { text = "MIT" }
@@ -33,13 +33,16 @@ dev = [
     "pytest>=7.4",
     "pytest-mock>=3.12",
     "responses>=0.24",
+    "build",
+    "twine",
 ]
+mcp = ["mcp>=1.0"]
 
 [project.scripts]
 nexmod = "nexmod:cli"
 
 [tool.setuptools]
-py-modules = ["nexmod"]
+py-modules = ["nexmod", "nexmod_mcp"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -27,7 +27,7 @@ from rich.table import Table
 from rich.progress import Progress, DownloadColumn, TransferSpeedColumn, BarColumn, TextColumn
 from rich.syntax import Syntax
 
-__version__ = "0.9.0"
+__version__ = "1.0.0"
 
 console = Console()
 log = logging.getLogger("nexmod")
@@ -5675,6 +5675,21 @@ def toggle_mods(game):
     else:
         log.error("dtkit-patch toggle failed: %s", output)
         console.print(f"[red]✗ Failed.[/red]")
+
+
+@cli.command("mcp-server")
+def mcp_server():
+    """Start the NexMod MCP server (requires: pip install nexmod[mcp])."""
+    try:
+        from nexmod_mcp import main as _mcp_main
+    except ImportError:
+        console.print(
+            "[red]MCP dependencies not installed.[/red]\n"
+            r"Install them: pip install nexmod\[mcp]" + "\n"
+            "Or:          pip install mcp"
+        )
+        sys.exit(1)
+    _mcp_main()
 
 
 if __name__ == "__main__":

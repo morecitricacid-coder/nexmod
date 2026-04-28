@@ -194,3 +194,23 @@ def test_logs_errors_only_filter(runner):
     assert "routine" not in result.output
     assert "bad thing" in result.output
     assert "suspicious" in result.output
+
+
+# ── nexmod mcp-server ─────────────────────────────────────────────────────────
+
+def test_mcp_server_import_error_message(runner, monkeypatch):
+    """mcp-server prints a helpful error when mcp package is not installed."""
+    import builtins
+    real_import = builtins.__import__
+
+    def _block_mcp(name, *args, **kwargs):
+        if name == "nexmod_mcp":
+            raise ImportError("No module named 'mcp'")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", _block_mcp)
+    result = runner.invoke(cli, ["mcp-server"])
+    assert result.exit_code == 1
+    assert "MCP dependencies not installed" in result.output
+    assert "pip install nexmod" in result.output
+    assert "pip install mcp" in result.output

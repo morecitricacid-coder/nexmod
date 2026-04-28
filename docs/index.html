@@ -430,7 +430,7 @@ footer{
     </div>
 
     <div class="hero-links">
-      <a href="https://pypi.org/project/nexmod/" class="pill pill-live">v0.9.0 · PyPI</a>
+      <a href="https://pypi.org/project/nexmod/" class="pill pill-live">v1.0.0 · PyPI</a>
       <a href="https://github.com/morecitricacid-coder/nexmod/actions/workflows/ci.yml" class="pill">CI passing</a>
       <span class="pill">MIT</span>
       <span class="pill">Python 3.10+</span>
@@ -539,6 +539,20 @@ footer{
         <span class="ftag">nexmod search darktide "enemy health"</span>
         <span class="ftag">--json</span>
         <span class="ftag">nexmod info darktide 1234 --remote</span>
+      </div>
+    </div>
+
+    <div class="feat">
+      <span class="feat-icon">&#9889;</span>
+      <div class="feat-title">MCP server</div>
+      <div class="feat-desc">
+        Native Claude / LLM tool integration &mdash; no subprocess, no text parsing,
+        just typed tool calls. Install once, then ask Claude to manage your mods directly.
+        <code style="font-family:monospace;font-size:0.82em">pip install nexmod[mcp]</code>
+      </div>
+      <div class="feat-tags">
+        <span class="ftag">claude mcp add nexmod -- nexmod mcp-server</span>
+        <span class="ftag">12 tools</span>
       </div>
     </div>
   </div>
@@ -682,7 +696,7 @@ footer{
       <a href="https://github.com/morecitricacid-coder/nexmod">GitHub</a>
       <a href="https://pypi.org/project/nexmod/">PyPI</a>
       <a href="https://github.com/morecitricacid-coder/nexmod/blob/main/CHANGELOG.md">Changelog</a>
-      <span>v0.9.0</span>
+      <span>v1.0.0</span>
       <span>MIT</span>
     </div>
   </div>
@@ -724,6 +738,9 @@ const SCRIPT = [
   { k:'out', h:'  <span class="tdim">–  True Level         1.0.9  (up to date)</span>' },
   { k:'out', h:'<span class="tok">✓</span>  <span class="tout">2 updated, 30 up to date.</span>' },
   { k:'out', h:'<span class="tok">✓</span>  <span class="tout">No missing dependencies.</span>' },
+  { k:'blank' },
+  { delay: 1200, k:'cmd', t:'claude mcp add nexmod -- nexmod mcp-server' },
+  { k:'out', h:'  <span class="tok">✓</span>  <span class="tout">MCP server registered &mdash; Claude can now manage your mods directly</span>' },
 ];
 
 const tb  = document.getElementById('tb');
