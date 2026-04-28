@@ -413,7 +413,7 @@ footer{
   <div class="hero-text">
     <div class="hero-eyebrow">
       <span class="hero-eyebrow-dot"></span>
-      Linux CLI · Nexus Premium
+      Linux CLI · Free &amp; Premium
     </div>
     <h1>nexmod</h1>
     <p class="hero-tagline">Nexus Mods management for Linux, done in the terminal.</p>
@@ -430,7 +430,7 @@ footer{
     </div>
 
     <div class="hero-links">
-      <a href="https://pypi.org/project/nexmod/" class="pill pill-live">v1.0.0 · PyPI</a>
+      <a href="https://pypi.org/project/nexmod/" class="pill pill-live">v1.0.1 · PyPI</a>
       <a href="https://github.com/morecitricacid-coder/nexmod/actions/workflows/ci.yml" class="pill">CI passing</a>
       <span class="pill">MIT</span>
       <span class="pill">Python 3.10+</span>
@@ -467,10 +467,12 @@ footer{
       <div class="feat-desc">
         Paste a full Nexus URL or pass a game slug + mod ID. Atomic download with MD5 verification
         before extraction. Supports .zip, .tar.gz, .7z. Detects conflicts before touching disk.
+        Free accounts: use <code style="font-family:monospace;font-size:0.82em">nexmod import</code>
+        to install a manually-downloaded archive — no Premium needed.
       </div>
       <div class="feat-tags">
         <span class="ftag">nexmod install darktide 1234</span>
-        <span class="ftag">nexmod install &lt;nexus-url&gt;</span>
+        <span class="ftag">nexmod import darktide ~/Downloads/mod.zip</span>
         <span class="ftag">--dry-run</span>
       </div>
     </div>
@@ -514,13 +516,14 @@ footer{
         environment before you touch anything.
         <code style="font-family:monospace;font-size:0.82em">rollback</code> restores from
         auto-saved version snapshots.
-        <code style="font-family:monospace;font-size:0.82em">fsck</code> audits the local DB.
-        Dep scan runs on every update so gaps can't silently accumulate.
+        <code style="font-family:monospace;font-size:0.82em">fsck --fix</code> repairs DB drift;
+        <code style="font-family:monospace;font-size:0.82em">fsck --scan</code> finds untracked
+        folders and offers to track them. Dep scan runs on every update so gaps can't accumulate.
       </div>
       <div class="feat-tags">
         <span class="ftag">nexmod doctor</span>
         <span class="ftag">nexmod rollback darktide 1234</span>
-        <span class="ftag">nexmod fsck --fix</span>
+        <span class="ftag">nexmod fsck --scan</span>
       </div>
     </div>
 
@@ -630,8 +633,11 @@ footer{
   <p class="sec-label">Quick start</p>
   <h2 class="sec-title">Up in four steps.</h2>
   <p class="sec-sub">
-    Requires a <strong style="color:var(--text)">Nexus Mods Premium</strong> account —
-    the fast-download API is Premium-only.
+    <strong style="color:var(--text)">Nexus Mods Premium</strong> unlocks direct API
+    downloads (<code style="font-family:monospace;font-size:0.88em">nexmod install</code>).
+    Free accounts can use
+    <code style="font-family:monospace;font-size:0.88em">nexmod import</code> to install
+    a manually-downloaded archive — no Premium needed.
   </p>
 
   <div class="code-block">
@@ -678,7 +684,7 @@ footer{
     <div class="req">
       <span class="req-icon">🍷</span>
       <span class="req-label">Optional</span>
-      <span class="req-val">Wine (Darktide patch only)</span>
+      <span class="req-val">Wine (legacy .exe fallback only)</span>
     </div>
   </div>
 </section>
@@ -696,7 +702,7 @@ footer{
       <a href="https://github.com/morecitricacid-coder/nexmod">GitHub</a>
       <a href="https://pypi.org/project/nexmod/">PyPI</a>
       <a href="https://github.com/morecitricacid-coder/nexmod/blob/main/CHANGELOG.md">Changelog</a>
-      <span>v1.0.0</span>
+      <span>v1.0.1</span>
       <span>MIT</span>
     </div>
   </div>
@@ -719,7 +725,7 @@ const SCRIPT = [
   { k:'out', h:'<span class="tok">✓</span>  <span class="tout">Premium       confirmed</span>' },
   { k:'out', h:'<span class="tok">✓</span>  <span class="tout">Steam         ~/.steam/steam/steamapps/</span>' },
   { k:'out', h:'<span class="tok">✓</span>  <span class="tout">Darktide      found — 32 mods tracked</span>' },
-  { k:'out', h:'<span class="tok">✓</span>  <span class="tout">Wine          /usr/bin/wine</span>' },
+  { k:'out', h:'<span class="tok">✓</span>  <span class="tout">dtkit-patch   native (no Wine required)</span>' },
   { k:'out', h:'<span class="tok">✓</span>  <span class="tout">7z            /usr/bin/7z</span>' },
   { k:'out', h:'<span class="tok">✓</span>  <span class="tout">Disk space    148 GB free</span>' },
   { k:'out', h:'<span class="tok">All checks passed.</span>' },
@@ -738,6 +744,15 @@ const SCRIPT = [
   { k:'out', h:'  <span class="tdim">–  True Level         1.0.9  (up to date)</span>' },
   { k:'out', h:'<span class="tok">✓</span>  <span class="tout">2 updated, 30 up to date.</span>' },
   { k:'out', h:'<span class="tok">✓</span>  <span class="tout">No missing dependencies.</span>' },
+  { k:'blank' },
+  { k:'cmd', t:'nexmod import darktide ~/Downloads/SomeMod-1234-5678-1-0.zip' },
+  { k:'out', h:'<span class="tdim">  Detected mod ID 1234 from filename.</span>' },
+  { k:'out', h:'<span class="tok">✓</span>  <span class="tout">Extracted to mods/SomeMod — no Premium needed</span>' },
+  { k:'blank' },
+  { k:'cmd', t:'nexmod fsck darktide --scan' },
+  { k:'out', h:'<span class="tdim">  Scanning mod folder for untracked directories...</span>' },
+  { k:'out', h:'  <span class="tamb">?</span>  <span class="tout">OldMod  </span><span class="tdim">not in DB — search or enter mod ID to track</span>' },
+  { k:'out', h:'<span class="tok">✓</span>  <span class="tout">Scan complete — 1 untracked folder found</span>' },
   { k:'blank' },
   { delay: 1200, k:'cmd', t:'claude mcp add nexmod -- nexmod mcp-server' },
   { k:'out', h:'  <span class="tok">✓</span>  <span class="tout">MCP server registered &mdash; Claude can now manage your mods directly</span>' },

@@ -29,7 +29,7 @@ from rich.table import Table
 from rich.progress import Progress, DownloadColumn, TransferSpeedColumn, BarColumn, TextColumn
 from rich.syntax import Syntax
 
-__version__ = "1.0.0"
+__version__ = "1.0.1"
 
 console = Console()
 log = logging.getLogger("nexmod")

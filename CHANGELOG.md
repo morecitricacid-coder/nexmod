@@ -8,6 +8,10 @@ All notable changes to nexmod are documented here. Format follows
 
 ## [Unreleased]
 
+---
+
+## [1.0.1] — Native dtkit-patch, free-tier import, fsck scan — 2026-04-28
+
 ### Added
 - **`nexmod import <game> <path>`** — free-tier workflow for installing a locally-downloaded
   archive. Parses the Nexus filename convention (`<Name>-<mod_id>-<file_id>-<ver>.zip`) to

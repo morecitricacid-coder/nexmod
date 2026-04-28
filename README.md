@@ -554,7 +554,7 @@ Or add manually to `~/.claude.json`:
   - Debian/Ubuntu: `sudo apt install p7zip-full`
   - Arch: `sudo pacman -S p7zip`
   - Fedora: `sudo dnf install p7zip p7zip-plugins`
-- Wine — only required for Darktide `enable` / `disable` / `toggle`.
+- Wine — only required as a fallback for legacy `dtkit-patch.exe`; the native Linux binary is downloaded automatically by `nexmod setup` and no longer needs Wine.
 
 ---
 
