@@ -3235,24 +3235,27 @@ def diag(game, lines, show_all):
 
     # Darktide: check if the game bundle was updated more recently than dtkit-patch.
     # After a Fatshark patch the bundle is reset and mods silently stop loading.
+    # Use a direct DB lookup (not resolve_mod_dir) to avoid sys.exit when path unregistered.
     if game == "darktide":
         try:
             db = get_db()
-            _mod_dir = resolve_mod_dir(game, db)
-            _game_dir = _mod_dir.parent
-            _bundle_dir = _game_dir / "bundle"
-            _dtkit = _find_dtkit(_game_dir)
-            if _bundle_dir.exists() and _dtkit and _dtkit.exists():
-                _dtkit_mtime = _dtkit.stat().st_mtime
-                _bundle_files = list(_bundle_dir.iterdir())
-                if _bundle_files:
-                    _newest_bundle = max(f.stat().st_mtime for f in _bundle_files)
-                    if _newest_bundle > _dtkit_mtime:
-                        console.print(
-                            "[yellow]Warning:[/yellow] Game bundle files are newer than dtkit-patch — "
-                            "a game update may have reset mod support.\n"
-                            "  If mods are not loading, re-run: [cyan]nexmod enable darktide[/cyan]"
-                        )
+            _row = db.execute("SELECT path FROM game_paths WHERE game=?", ("darktide",)).fetchone()
+            if _row:
+                _mod_dir = Path(_row["path"])
+                _game_dir = _mod_dir.parent
+                _bundle_dir = _game_dir / "bundle"
+                _dtkit = _find_dtkit(_game_dir)
+                if _bundle_dir.exists() and _dtkit and _dtkit.exists():
+                    _dtkit_mtime = _dtkit.stat().st_mtime
+                    _bundle_files = list(_bundle_dir.iterdir())
+                    if _bundle_files:
+                        _newest_bundle = max(f.stat().st_mtime for f in _bundle_files)
+                        if _newest_bundle > _dtkit_mtime:
+                            console.print(
+                                "[yellow]Warning:[/yellow] Game bundle files are newer than dtkit-patch — "
+                                "a game update may have reset mod support.\n"
+                                "  If mods are not loading, re-run: [cyan]nexmod enable darktide[/cyan]"
+                            )
         except Exception:
             pass  # never crash diag due to this optional check
 
