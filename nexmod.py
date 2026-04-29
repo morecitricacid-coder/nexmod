@@ -29,7 +29,7 @@ from rich.table import Table
 from rich.progress import Progress, DownloadColumn, TransferSpeedColumn, BarColumn, TextColumn
 from rich.syntax import Syntax
 
-__version__ = "1.0.2"
+__version__ = "1.1.0"
 
 console = Console()
 log = logging.getLogger("nexmod")
@@ -259,10 +259,46 @@ def _migration_003_plugin_files(conn: sqlite3.Connection) -> None:
     """)
 
 
+def _migration_004_collections(conn: sqlite3.Connection) -> None:
+    """Create collections tracking tables.
+
+    collections: one row per installed Nexus Collection.
+    collection_mods: junction — which tracked mod came from which collection.
+    """
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS collections (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            game            TEXT NOT NULL,
+            slug            TEXT NOT NULL,
+            name            TEXT NOT NULL,
+            author          TEXT,
+            revision        INTEGER NOT NULL,
+            mod_count       INTEGER,
+            summary         TEXT,
+            installed_at    TEXT NOT NULL,
+            updated_at      TEXT,
+            UNIQUE(game, slug)
+        );
+        CREATE INDEX IF NOT EXISTS idx_collections_game
+            ON collections(game);
+        CREATE TABLE IF NOT EXISTS collection_mods (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            game            TEXT NOT NULL,
+            slug            TEXT NOT NULL,
+            mod_id          INTEGER NOT NULL,
+            optional        INTEGER NOT NULL DEFAULT 0,
+            UNIQUE(game, slug, mod_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_collection_mods_game_slug
+            ON collection_mods(game, slug);
+    """)
+
+
 SCHEMA_MIGRATIONS: list = [
     ("001_mods_folder_name", "ALTER TABLE mods ADD COLUMN folder_name TEXT"),
     ("002_load_order_active_profile", "ALTER TABLE load_order_state ADD COLUMN active_profile TEXT"),
     ("003_plugin_files", _migration_003_plugin_files),
+    ("004_collections", _migration_004_collections),
 ]
 
 
@@ -466,6 +502,188 @@ def api_download_urls(domain: str, mod_id: int, file_id: int, api_key: str, *,
 
 def api_updated_mods(domain: str, api_key: str, period: str = "1w") -> list:
     return nexus_get(f"games/{domain}/mods/updated.json?period={period}", api_key)
+
+
+# ── Collections GraphQL helpers ───────────────────────────────────────────────
+
+_GQL_URL = "https://api.nexusmods.com/v2/graphql"
+_GQL_HEADERS_BASE = {
+    "Application-Name": "nexmod",
+    "Application-Version": __version__,
+    "Protocol-Version": "1.0.0",
+    "Content-Type": "application/json",
+}
+
+
+def _gql_post(query: str, variables: dict, api_key: str) -> dict:
+    """POST a GraphQL query to the Nexus v2 endpoint with retry on 5xx/429.
+
+    Returns the full parsed JSON response (caller checks ``data`` / ``errors``).
+    """
+    headers = {**_GQL_HEADERS_BASE, "APIKEY": api_key}
+    payload = json.dumps({"query": query, "variables": variables}).encode()
+
+    for attempt in range(1, NEXUS_MAX_RETRIES + 1):
+        try:
+            r = requests.post(_GQL_URL, headers=headers, data=payload, timeout=20)
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
+            if attempt == NEXUS_MAX_RETRIES:
+                raise RuntimeError(f"GraphQL network error after {attempt} attempts: {e}") from e
+            time.sleep(_backoff_delay(attempt))
+            continue
+
+        if r.status_code == 429:
+            try:
+                wait = min(float(r.headers.get("Retry-After", "30")), NEXUS_429_MAX_WAIT)
+            except ValueError:
+                wait = 30.0
+            if attempt == NEXUS_MAX_RETRIES:
+                raise RuntimeError("GraphQL rate limited — try again later.")
+            time.sleep(wait)
+            continue
+
+        if 500 <= r.status_code < 600:
+            if attempt == NEXUS_MAX_RETRIES:
+                raise RuntimeError(f"GraphQL HTTP {r.status_code} after {attempt} retries")
+            time.sleep(_backoff_delay(attempt))
+            continue
+
+        if not r.ok:
+            raise RuntimeError(f"GraphQL HTTP {r.status_code}: {r.text[:300]}")
+
+        return r.json()
+
+    raise RuntimeError("GraphQL request failed after all retries")
+
+
+def api_collection_info(slug: str, domain: str, api_key: str) -> dict:
+    """Fetch collection metadata by slug.
+
+    Returns a dict with keys: name, summary, description, slug, id, gameId,
+    endorsements, totalDownloads, user (dict), latestPublishedRevision (dict).
+
+    Raises RuntimeError if not found or on API error.
+    """
+    query = """
+query CollectionInfo($slug: String!, $domainName: String) {
+  collection(slug: $slug, domainName: $domainName) {
+    name
+    summary
+    description
+    slug
+    id
+    gameId
+    endorsements
+    totalDownloads
+    user { name memberId }
+    latestPublishedRevision {
+      revisionNumber
+      modCount
+      assetsSizeBytes
+    }
+  }
+}
+"""
+    resp = _gql_post(query, {"slug": slug, "domainName": domain}, api_key)
+    if resp.get("errors"):
+        first = resp["errors"][0]
+        code = first.get("extensions", {}).get("code", "")
+        if code == "NOT_FOUND":
+            raise RuntimeError(f"Collection '{slug}' not found (domain: {domain})")
+        raise RuntimeError(f"GraphQL error: {first.get('message', str(resp['errors']))}")
+    data = (resp.get("data") or {}).get("collection")
+    if not data:
+        raise RuntimeError(f"Collection '{slug}' returned no data")
+    return data
+
+
+def api_collection_revision(slug: str, domain: str, api_key: str,
+                             revision: int | None = None) -> dict:
+    """Fetch a collection revision's mod file list.
+
+    When *revision* is None the API returns the latest published revision.
+
+    Returns a dict with keys: revisionNumber, modCount, modFiles.
+    Each modFiles entry has: optional (bool), updatePolicy (str),
+    file (dict with modId, fileId, name, version, sizeInBytes).
+
+    Raises RuntimeError on API error or collection not found.
+    """
+    query = """
+query CollectionRevision($slug: String!, $revision: Int, $domainName: String) {
+  collectionRevision(slug: $slug, revision: $revision, domainName: $domainName) {
+    revisionNumber
+    modCount
+    modFiles {
+      optional
+      updatePolicy
+      file {
+        modId
+        fileId
+        name
+        version
+        sizeInBytes
+      }
+    }
+  }
+}
+"""
+    resp = _gql_post(query, {"slug": slug, "revision": revision, "domainName": domain}, api_key)
+    if resp.get("errors"):
+        first = resp["errors"][0]
+        code = first.get("extensions", {}).get("code", "")
+        if code == "NOT_FOUND":
+            raise RuntimeError(f"Collection '{slug}' revision not found (domain: {domain})")
+        raise RuntimeError(f"GraphQL error: {first.get('message', str(resp['errors']))}")
+    data = (resp.get("data") or {}).get("collectionRevision")
+    if not data:
+        raise RuntimeError(f"Collection '{slug}' revision returned no data")
+    return data
+
+
+def api_list_collections(domain: str, api_key: str, count: int = 10) -> dict:
+    """List published collections for a game domain.
+
+    Returns a dict with keys: totalCount (int), nodes (list of collection dicts).
+    Each node has: name, slug, id, gameId, summary, endorsements,
+    totalDownloads, latestPublishedRevision (dict with revisionNumber, modCount).
+    """
+    count = max(1, min(50, count))
+    query = """
+query ListCollections($filter: CollectionsSearchFilter, $count: Int) {
+  collectionsV2(filter: $filter, count: $count) {
+    totalCount
+    nodes {
+      name
+      slug
+      id
+      gameId
+      summary
+      endorsements
+      totalDownloads
+      latestPublishedRevision {
+        revisionNumber
+        modCount
+      }
+    }
+  }
+}
+"""
+    variables = {
+        "filter": {
+            "gameDomain": [{"value": domain, "op": "EQUALS"}],
+        },
+        "count": count,
+    }
+    resp = _gql_post(query, variables, api_key)
+    if resp.get("errors"):
+        first = resp["errors"][0]
+        raise RuntimeError(f"GraphQL error: {first.get('message', str(resp['errors']))}")
+    data = (resp.get("data") or {}).get("collectionsV2")
+    if data is None:
+        raise RuntimeError("collectionsV2 returned no data")
+    return data
+
 
 def api_search_mods(domain: str, query: str, api_key: str, count: int = 10) -> list:
     """Search Nexus mods via the v2 GraphQL API.
@@ -978,11 +1196,20 @@ def extract_archive(archive: Path, target_dir: Path):
                     "  openSUSE:      sudo zypper install p7zip"
                 )
             # Path-traversal check: list contents first and reject any unsafe member.
+            # Note: `7z l -slt` emits the archive's own path as the first "Path = "
+            # line (before the first "----------" separator), which is always absolute.
+            # Skip the archive-header stanza; only inspect member paths.
             list_result = subprocess.run(
                 [_7z, "l", "-slt", str(archive)],
                 capture_output=True, text=True,
             )
+            in_header = True
             for line in list_result.stdout.splitlines():
+                if line.startswith("----------"):
+                    in_header = False
+                    continue
+                if in_header:
+                    continue
                 if line.startswith("Path = "):
                     mpath = line[7:].strip()
                     if os.path.isabs(mpath) or ".." in mpath.replace("\\", "/").split("/"):
@@ -3683,8 +3910,8 @@ def doctor(game):
             # Starfield: check SFSE + Plugins.txt
             if slug == "starfield":
                 sfse_loader = path / "sfse_loader.exe"
-                sfse_dll    = path / "sfse_steam_loader.dll"
-                sfse_ok = sfse_loader.exists() and sfse_dll.exists()
+                sfse_dlls   = list(path.glob("sfse_*.dll"))
+                sfse_ok = sfse_loader.exists() and bool(sfse_dlls)
                 status(f"{slug}: SFSE installed",
                        sfse_ok,
                        str(sfse_loader) if sfse_ok else
@@ -4889,7 +5116,7 @@ def sfse_install(game, from_file, dry_run):
     if dry_run:
         console.print(f"\n[bold](dry-run) Would install to:[/bold] {game_root}")
         console.print(f"  File: {chosen['file_name']} ({chosen.get('size_kb', '?')} KB)")
-        console.print(f"  Target: {game_root}/sfse_loader.exe  +  sfse_steam_loader.dll  +  versioned DLL")
+        console.print(f"  Target: {game_root}/sfse_loader.exe  +  sfse_<version>.dll")
         console.print(f"\n[bold]After installation, set this Steam launch option:[/bold]")
         console.print(f"  [cyan]{SFSE_STEAM_LAUNCH_OPTION}[/cyan]")
         return
@@ -4921,11 +5148,14 @@ def sfse_install(game, from_file, dry_run):
         finally:
             archive.unlink(missing_ok=True)
 
-    # Verify key files landed
+    # Verify key files landed. The DLL is versioned (e.g. sfse_1_16_236.dll)
+    # not the legacy "sfse_steam_loader.dll" name — use a glob.
     sfse_loader = game_root / "sfse_loader.exe"
-    sfse_dll    = game_root / "sfse_steam_loader.dll"
-    if sfse_loader.exists() and sfse_dll.exists():
+    sfse_dlls   = list(game_root.glob("sfse_*.dll"))
+    if sfse_loader.exists() and sfse_dlls:
+        dll_names = ", ".join(d.name for d in sfse_dlls)
         console.print(f"\n[green]✓ SFSE installed to {game_root}[/green]")
+        console.print(f"  [dim]{sfse_loader.name}  +  {dll_names}[/dim]")
     else:
         console.print(f"\n[yellow]⚠ Installation complete but sfse_loader.exe not found at {game_root}.[/yellow]")
         console.print("  The archive may have a different layout. Check manually.")
@@ -4939,12 +5169,28 @@ def sfse_install(game, from_file, dry_run):
 def _do_sfse_extract(archive: Path, game_root: Path, own_archive: bool) -> None:
     """Extract SFSE archive, placing root-level files into game_root.
 
-    SFSE archives typically contain files at the root level (sfse_loader.exe,
-    sfse_steam_loader.dll, etc.) and optionally a Data/ subtree. Root-level
-    files and Data/ both land correctly when extracted to game_root.
+    SFSE archives may wrap everything in a versioned subdirectory (e.g.
+    sfse_0_2_19/).  After extraction we detect that case (sfse_loader.exe
+    found one level down) and flatten the subtree into game_root.
     """
     console.print(f"  Extracting to [dim]{game_root}[/dim]...")
     extract_archive(archive, game_root)
+
+    # Flatten if the archive landed in a single versioned subdir.
+    if not (game_root / "sfse_loader.exe").exists():
+        for subdir in game_root.iterdir():
+            if subdir.is_dir() and (subdir / "sfse_loader.exe").exists():
+                for item in subdir.iterdir():
+                    dest = game_root / item.name
+                    if dest.exists() and dest.is_dir():
+                        shutil.rmtree(dest)
+                    elif dest.exists():
+                        dest.unlink()
+                    shutil.move(str(item), game_root)
+                subdir.rmdir()
+                log.info("SFSE subdir %s flattened into %s", subdir.name, game_root)
+                break
+
     log.info("SFSE extracted to %s", game_root)
 
 
@@ -6205,6 +6451,426 @@ def toggle_mods(game):
     else:
         log.error("dtkit-patch toggle failed: %s", output)
         console.print(f"[red]✗ Failed.[/red]")
+
+
+# ── collection group ──────────────────────────────────────────────────────────
+
+@cli.group()
+def collection():
+    """Browse, install, and track Nexus Mods Collections."""
+    pass
+
+
+@collection.command("info")
+@click.argument("game")
+@click.argument("slug")
+@click.option("--json", "as_json", is_flag=True, help="Machine-readable JSON output.")
+def collection_info(game, slug, as_json):
+    """Show metadata for a Nexus Collection.
+
+    SLUG is the short identifier from the collection URL
+    (e.g. 'xktihh' from nexusmods.com/warhammer40kdarktide/collections/xktihh).
+    """
+    api_key = get_api_key()
+    info = GAMES.get(game)
+    domain = info["domain"] if info else game
+
+    try:
+        with console.status(f"Fetching collection '{slug}'..."):
+            col = api_collection_info(slug, domain, api_key)
+    except RuntimeError as e:
+        console.print(f"[red]{e}[/red]")
+        sys.exit(1)
+
+    rev = col.get("latestPublishedRevision") or {}
+
+    if as_json:
+        click.echo(json.dumps({
+            "slug": col.get("slug"),
+            "name": col.get("name"),
+            "summary": col.get("summary"),
+            "author": (col.get("user") or {}).get("name"),
+            "endorsements": col.get("endorsements"),
+            "total_downloads": col.get("totalDownloads"),
+            "revision": rev.get("revisionNumber"),
+            "mod_count": rev.get("modCount"),
+        }, indent=2))
+        return
+
+    from rich.table import Table
+    author = (col.get("user") or {}).get("name", "?")
+    console.print(f"\n[bold]{col.get('name', slug)}[/bold]  [dim]by {author}[/dim]")
+    console.print(f"  Slug:      [cyan]{col.get('slug')}[/cyan]")
+    console.print(f"  Game ID:   {col.get('gameId')}")
+    console.print(f"  Revision:  {rev.get('revisionNumber', '?')}")
+    console.print(f"  Mods:      {rev.get('modCount', '?')}")
+    console.print(f"  Endorsements:    {col.get('endorsements', 0):,}")
+    console.print(f"  Total downloads: {col.get('totalDownloads', 0):,}")
+    summary = col.get("summary", "")
+    if summary:
+        console.print(f"\n  {summary}")
+    console.print(
+        f"\n  [dim]Install: nexmod collection install {game} {slug}[/dim]"
+    )
+
+
+@collection.command("install")
+@click.argument("game")
+@click.argument("slug")
+@click.option("--revision", "revision", type=int, default=None,
+              help="Pin to a specific revision number (default: latest).")
+@click.option("--optional/--no-optional", default=False,
+              help="Also install mods marked optional in the collection.")
+@click.option("--dry-run", is_flag=True,
+              help="Show what would be installed without downloading anything.")
+@click.option("--yes", is_flag=True,
+              help="Skip confirmation prompt.")
+def collection_install(game, slug, revision, optional, dry_run, yes):
+    """Install all mods in a Nexus Collection.
+
+    Required mods are always installed. Use --optional to include mods the
+    collection author marked as optional. Mods already tracked in the DB are
+    skipped. Failed mods are skipped with a warning — the rest continue.
+
+    Free-tier accounts cannot auto-download; use --dry-run to get the list,
+    then install each mod manually via 'nexmod install <game> <id> --from-file'.
+    """
+    api_key = get_api_key()
+    info = GAMES.get(game)
+    domain = info["domain"] if info else game
+    db = get_db()
+
+    # ── Fetch collection metadata + revision mod list ─────────────────────────
+    try:
+        with console.status(f"Fetching collection '{slug}'..."):
+            col = api_collection_info(slug, domain, api_key)
+            rev_data = api_collection_revision(slug, domain, api_key, revision=revision)
+    except RuntimeError as e:
+        console.print(f"[red]{e}[/red]")
+        sys.exit(1)
+
+    col_name = col.get("name", slug)
+    rev_num = rev_data.get("revisionNumber", "?")
+    mod_files = rev_data.get("modFiles", [])
+    author = (col.get("user") or {}).get("name", "?")
+
+    # ── Filter optional ───────────────────────────────────────────────────────
+    to_install = [
+        mf for mf in mod_files
+        if not mf.get("optional") or optional
+    ]
+    skipped_optional = [
+        mf for mf in mod_files
+        if mf.get("optional") and not optional
+    ]
+
+    # ── Check which are already installed ────────────────────────────────────
+    already_ids = {
+        row["mod_id"]
+        for row in db.execute("SELECT mod_id FROM mods WHERE game = ?", (game,)).fetchall()
+    }
+    pending = [mf for mf in to_install if mf["file"]["modId"] not in already_ids]
+    already_in_db = [mf for mf in to_install if mf["file"]["modId"] in already_ids]
+
+    # ── Premium check ─────────────────────────────────────────────────────────
+    try:
+        user_data = nexus_get("users/validate.json", api_key)
+        is_premium = user_data.get("is_premium", False)
+    except Exception:
+        is_premium = False
+
+    # ── Summary ───────────────────────────────────────────────────────────────
+    console.print(f"\n[bold]Collection:[/bold] {col_name}")
+    console.print(f"  Author:   {author}")
+    console.print(f"  Revision: {rev_num}")
+    console.print(f"  Mods to install:  [cyan]{len(pending)}[/cyan]")
+    if already_in_db:
+        console.print(
+            f"  Already tracked:  [dim]{len(already_in_db)} (will be skipped)[/dim]"
+        )
+    if skipped_optional:
+        console.print(
+            f"  Optional skipped: [dim]{len(skipped_optional)} "
+            f"(use --optional to include)[/dim]"
+        )
+    if not is_premium:
+        console.print(
+            "\n  [yellow]Free account detected — direct downloads require Nexus Premium.[/yellow]\n"
+            "  Mods that cannot be downloaded will be listed for manual install.\n"
+            "  Use --dry-run to preview the full list first."
+        )
+
+    if not pending:
+        console.print("\n[green]Nothing to install — all collection mods already tracked.[/green]")
+        _record_collection(db, game, slug, col, rev_data)
+        for mf in already_in_db:
+            _record_collection_mod(db, game, slug, mf["file"]["modId"], optional=bool(mf.get("optional")))
+        return
+
+    if dry_run:
+        from rich.table import Table
+        t = Table(title=f"Would install ({len(pending)} mods)", show_lines=False)
+        t.add_column("Mod ID", style="cyan", justify="right")
+        t.add_column("File", style="dim")
+        t.add_column("Version", style="dim")
+        t.add_column("Optional", justify="center")
+        t.add_column("Size")
+        for mf in pending:
+            f = mf["file"]
+            size_kb = int(f.get("sizeInBytes") or 0) // 1024
+            t.add_row(
+                str(f["modId"]),
+                f.get("name", "?"),
+                f.get("version", "?"),
+                "[yellow]yes[/yellow]" if mf.get("optional") else "no",
+                f"{size_kb:,} KB" if size_kb else "?",
+            )
+        console.print(t)
+        console.print("[dim]Dry run — no files downloaded.[/dim]")
+        return
+
+    if not yes:
+        if not click.confirm(f"\nInstall {len(pending)} mod(s) from '{col_name}'?", default=True):
+            console.print("[dim]Aborted.[/dim]")
+            return
+
+    # ── Install loop ──────────────────────────────────────────────────────────
+    installed: list[int] = []
+    failed: list[tuple[int, str]] = []
+    free_manual: list[dict] = []
+
+    for idx, mf in enumerate(pending, 1):
+        f = mf["file"]
+        mod_id = f["modId"]
+        file_id = f["fileId"]
+        file_name = f.get("name", str(mod_id))
+        console.print(
+            f"\n[dim][{idx}/{len(pending)}][/dim] "
+            f"[bold]{file_name}[/bold] (mod {mod_id}, file {file_id})"
+        )
+
+        try:
+            do_install(game, mod_id, file_id, api_key, db)
+            installed.append(mod_id)
+        except SystemExit:
+            # do_install calls sys.exit(1) on certain hard failures.
+            # Treat as failure and continue with the next mod.
+            msg = "install failed (see above)"
+            log.warning("collection install: mod_id=%s failed with sys.exit", mod_id)
+            if not is_premium:
+                # Likely a Premium-required download failure; queue for manual.
+                free_manual.append({"mod_id": mod_id, "file_id": file_id, "name": file_name})
+            else:
+                failed.append((mod_id, msg))
+        except RuntimeError as e:
+            emsg = str(e)
+            log.warning("collection install: mod_id=%s error: %s", mod_id, emsg)
+            if "premium" in emsg.lower() or "no download urls" in emsg.lower():
+                free_manual.append({"mod_id": mod_id, "file_id": file_id, "name": file_name})
+            else:
+                failed.append((mod_id, emsg))
+            console.print(f"  [yellow]Skipping mod {mod_id}: {emsg}[/yellow]")
+        except Exception as e:
+            emsg = str(e)
+            log.warning("collection install: mod_id=%s unexpected: %s", mod_id, emsg)
+            failed.append((mod_id, emsg))
+            console.print(f"  [yellow]Skipping mod {mod_id}: {emsg}[/yellow]")
+
+    # ── Record collection in DB ───────────────────────────────────────────────
+    _record_collection(db, game, slug, col, rev_data)
+    # Junction table: all mods we attempted (installed + already_in_db)
+    for mod_id in installed:
+        _record_collection_mod(db, game, slug, mod_id, optional=False)
+    for mf in already_in_db:
+        _record_collection_mod(db, game, slug, mf["file"]["modId"], optional=bool(mf.get("optional")))
+
+    # ── Final report ──────────────────────────────────────────────────────────
+    console.print(f"\n[bold]Collection install complete:[/bold] {col_name} r{rev_num}")
+    console.print(f"  [green]Installed:[/green]       {len(installed)}")
+    if already_in_db:
+        console.print(f"  [dim]Already tracked:[/dim] {len(already_in_db)}")
+    if failed:
+        console.print(f"  [red]Failed:[/red]          {len(failed)}")
+        for mod_id, reason in failed:
+            console.print(f"    mod {mod_id}: {reason}")
+    if free_manual:
+        console.print(
+            f"\n  [yellow]{len(free_manual)} mods require Premium to auto-download.[/yellow]\n"
+            "  Download them manually from nexusmods.com and install with:\n"
+            f"  nexmod install {game} <mod_id> --from-file <archive>"
+        )
+        from rich.table import Table
+        t = Table(show_lines=False, box=None)
+        t.add_column("Mod ID", style="cyan")
+        t.add_column("Name")
+        for entry in free_manual:
+            t.add_row(str(entry["mod_id"]), entry["name"])
+        console.print(t)
+
+
+@collection.command("list")
+@click.argument("game")
+@click.option("--available", is_flag=True,
+              help="Browse published collections on Nexus (top 20 by downloads).")
+@click.option("--count", type=int, default=20, show_default=True,
+              help="Number of available collections to fetch (1–50).")
+@click.option("--json", "as_json", is_flag=True, help="Machine-readable JSON output.")
+def collection_list(game, available, count, as_json):
+    """List installed collections or browse available ones on Nexus.
+
+    Without --available: shows collections you have installed locally.
+    With --available: queries Nexus for published collections for this game.
+    """
+    api_key = get_api_key()
+    info = GAMES.get(game)
+    domain = info["domain"] if info else game
+    db = get_db()
+
+    if available:
+        try:
+            with console.status(f"Fetching collections for {game}..."):
+                result = api_list_collections(domain, api_key, count=count)
+        except RuntimeError as e:
+            console.print(f"[red]{e}[/red]")
+            sys.exit(1)
+
+        nodes = result.get("nodes", [])
+        total = result.get("totalCount", 0)
+
+        if as_json:
+            click.echo(json.dumps({
+                "game": game,
+                "total_available": total,
+                "showing": len(nodes),
+                "collections": [
+                    {
+                        "slug": n.get("slug"),
+                        "name": n.get("name"),
+                        "summary": n.get("summary"),
+                        "endorsements": n.get("endorsements"),
+                        "total_downloads": n.get("totalDownloads"),
+                        "revision": (n.get("latestPublishedRevision") or {}).get("revisionNumber"),
+                        "mod_count": (n.get("latestPublishedRevision") or {}).get("modCount"),
+                    }
+                    for n in nodes
+                ],
+            }, indent=2))
+            return
+
+        from rich.table import Table
+        t = Table(
+            title=f"Collections for {game} ({total} total, showing {len(nodes)})",
+            show_lines=False,
+        )
+        t.add_column("Slug", style="cyan", no_wrap=True)
+        t.add_column("Name")
+        t.add_column("Rev", justify="right")
+        t.add_column("Mods", justify="right")
+        t.add_column("DLs", justify="right")
+        t.add_column("Endorsed", justify="right")
+        for n in nodes:
+            rev = n.get("latestPublishedRevision") or {}
+            t.add_row(
+                n.get("slug", "?"),
+                n.get("name", "?"),
+                str(rev.get("revisionNumber", "?")),
+                str(rev.get("modCount", "?")),
+                f"{n.get('totalDownloads', 0):,}",
+                f"{n.get('endorsements', 0):,}",
+            )
+        console.print(t)
+        console.print(
+            f"[dim]Install: nexmod collection install {game} <slug>[/dim]\n"
+            f"[dim]Info:    nexmod collection info {game} <slug>[/dim]"
+        )
+        return
+
+    # ── Local installed collections ───────────────────────────────────────────
+    rows = db.execute(
+        "SELECT slug, name, author, revision, mod_count, installed_at, updated_at "
+        "FROM collections WHERE game = ? ORDER BY installed_at DESC",
+        (game,),
+    ).fetchall()
+
+    if as_json:
+        click.echo(json.dumps({
+            "game": game,
+            "installed": [
+                {
+                    "slug": r["slug"],
+                    "name": r["name"],
+                    "author": r["author"],
+                    "revision": r["revision"],
+                    "mod_count": r["mod_count"],
+                    "installed_at": r["installed_at"],
+                }
+                for r in rows
+            ],
+        }, indent=2))
+        return
+
+    if not rows:
+        console.print(f"[yellow]No collections installed for {game}.[/yellow]")
+        console.print(
+            f"  Browse available: nexmod collection list {game} --available\n"
+            f"  Install one:      nexmod collection install {game} <slug>"
+        )
+        return
+
+    from rich.table import Table
+    t = Table(title=f"Installed collections — {game}", show_lines=False)
+    t.add_column("Slug", style="cyan", no_wrap=True)
+    t.add_column("Name")
+    t.add_column("Author")
+    t.add_column("Rev", justify="right")
+    t.add_column("Mods", justify="right")
+    t.add_column("Installed", style="dim")
+    for r in rows:
+        t.add_row(
+            r["slug"],
+            r["name"],
+            r["author"] or "?",
+            str(r["revision"]),
+            str(r["mod_count"] or "?"),
+            (r["installed_at"] or "")[:10],
+        )
+    console.print(t)
+
+
+# ── collection DB helpers ─────────────────────────────────────────────────────
+
+def _record_collection(db: sqlite3.Connection, game: str, slug: str,
+                        col: dict, rev_data: dict) -> None:
+    """Upsert a collection row in the collections table."""
+    rev = rev_data.get("revisionNumber") or col.get("latestPublishedRevision", {}).get("revisionNumber")
+    mod_count = rev_data.get("modCount") or col.get("latestPublishedRevision", {}).get("modCount")
+    author = (col.get("user") or {}).get("name")
+    db.execute("""
+        INSERT INTO collections (game, slug, name, author, revision, mod_count, summary, installed_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(game, slug) DO UPDATE SET
+            name       = excluded.name,
+            author     = COALESCE(excluded.author, collections.author),
+            revision   = excluded.revision,
+            mod_count  = excluded.mod_count,
+            summary    = COALESCE(excluded.summary, collections.summary),
+            updated_at = excluded.updated_at
+    """, (
+        game, slug, col.get("name", slug), author, rev, mod_count,
+        col.get("summary"), now_iso(), now_iso(),
+    ))
+    db.commit()
+
+
+def _record_collection_mod(db: sqlite3.Connection, game: str, slug: str,
+                             mod_id: int, optional: bool = False) -> None:
+    """Record a mod→collection association (idempotent)."""
+    db.execute("""
+        INSERT INTO collection_mods (game, slug, mod_id, optional)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(game, slug, mod_id) DO NOTHING
+    """, (game, slug, mod_id, 1 if optional else 0))
+    db.commit()
 
 
 @cli.command("mcp-server")

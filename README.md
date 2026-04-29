@@ -14,6 +14,7 @@ A Linux-native CLI mod manager for [Nexus Mods](https://www.nexusmods.com/).
 ## Features
 
 - Install / track / update mods by **mod ID *or* full Nexus URL**
+- **Collections** — install an entire curated Nexus Collection in one command; browse available collections per game; tracks which mods came from which collection
 - **`nxm://` link handler** — register once, then click "Mod Manager Download" on any Nexus mod page
 - **Rollback** — every install/update is snapshotted; one command restores the previous version
 - Named **profiles** for hotswapping load orders (e.g. `minimal` ↔ `full`)
@@ -150,6 +151,16 @@ nexmod profile load darktide full        # back to full
 | `nexmod track <game> <mod_id>` | — | Record an already-installed mod for update tracking. URL form supported. |
 | `nexmod scan <game>` | `--dry-run` | Import all mods from `vortex.deployment.json`. |
 | `nexmod remove <game> <mod_id>` | `--purge`, `--yes`, `--dry-run`, `--force-legacy-purge` | Untrack. `--purge` also deletes the mod folder (with confirmation; `--yes` skips). Rows missing `folder_name` (legacy installs) refuse to purge unless `--force-legacy-purge` is set — run `nexmod fsck --fix` first. |
+
+### Collections
+
+Install a curated Nexus Collection in one command. A Collection is a set of mods published by another user on Nexus Mods. The `slug` is the short identifier from the collection URL (e.g. `xktihh` from `nexusmods.com/warhammer40kdarktide/collections/xktihh`).
+
+| Command | Flags | Description |
+|---------|-------|-------------|
+| `nexmod collection info <game> <slug>` | `--json` | Show collection metadata: name, author, revision, mod count, description, endorsements, download count. |
+| `nexmod collection install <game> <slug>` | `--revision N`, `--optional`, `--dry-run`, `--yes` | Install all required mods in the collection. `--optional` also installs mods the collection author marked optional. `--dry-run` prints the mod list without downloading. Mods already in the DB are skipped. Failed mods are skipped with a warning; the rest continue. Free accounts: mods that require Premium are queued for manual install and listed at the end. **Requires Premium** for automatic downloads. |
+| `nexmod collection list <game>` | `--available`, `--count N` (1–50), `--json` | Without `--available`: lists locally installed collections. With `--available`: queries Nexus for published collections for this game (sorted by downloads). |
 
 ### Updates
 

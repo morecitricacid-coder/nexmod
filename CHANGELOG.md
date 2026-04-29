@@ -10,6 +10,41 @@ All notable changes to nexmod are documented here. Format follows
 
 ---
 
+## [1.1.0] — Collections support — 2026-04-28
+
+### Added
+
+- **`nexmod collection` command group** — browse, install, and track Nexus Mods Collections.
+  - `nexmod collection info <game> <slug>` — fetch and display collection metadata (name,
+    author, revision, mod count, description, endorsements, download count). `--json` flag
+    for machine-readable output.
+  - `nexmod collection install <game> <slug>` — install all mods in the collection using
+    the existing install pipeline. Options: `--revision N` (pin to a specific revision),
+    `--optional` (also install mods the author marked optional), `--dry-run` (preview the
+    mod list without downloading), `--yes` (skip confirmation). Mods already tracked in
+    the DB are skipped. Failed mods are skipped with a warning; the rest continue. Free-tier
+    accounts get a table of mods that require manual download.
+  - `nexmod collection list <game>` — list locally installed collections. `--available`
+    queries Nexus for published collections for the game (top N by downloads). `--json`
+    for machine-readable output.
+- **Schema migration 004** — `collections` table (one row per installed collection with
+  slug, name, author, revision, mod count, timestamps) and `collection_mods` junction
+  table (maps tracked mods back to the collection they came from). Both tables are added
+  via the append-only migrations framework; existing installs receive them automatically
+  on next run.
+- **Three new GraphQL helpers** — `api_collection_info`, `api_collection_revision`,
+  `api_list_collections` — all using the Nexus v2 GraphQL endpoint
+  (`api.nexusmods.com/v2/graphql`). Each applies the same retry/429-backoff discipline
+  as `nexus_get` but over `requests.post`. Rate limit is shared with v1.
+
+### Internal
+
+- `_gql_post` helper centralises GraphQL POST logic (headers, retry, error extraction).
+- `_record_collection` / `_record_collection_mod` — idempotent DB upsert helpers used by
+  `collection install`.
+
+---
+
 ## [1.0.2] — Auto update check — 2026-04-28
 
 ### Added
