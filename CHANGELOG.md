@@ -6,7 +6,42 @@ All notable changes to nexmod are documented here. Format follows
 
 ---
 
-## [Unreleased]
+## [1.2.0] — 2026-04-29
+
+### Added
+
+- **`collection install --overwrite`** — forces reinstall of mods that are already tracked
+  at the same or newer version. Without this flag, mods with a collection-provided version
+  that is older than the locally installed version are skipped with a "would downgrade" note.
+- **Flat-install file tracking** (`installed_files` column, schema migration 005) — mods that
+  extract files into an existing directory without creating a new top-level folder (e.g. SFSE
+  plugins landing in `Data/SFSE/Plugins/`) now have every installed file recorded as a JSON
+  list. `remove --purge` uses this manifest to delete individual files when no `folder_name`
+  is available.
+- **`_list_archive_files`** helper — lists file paths inside any supported archive format
+  (zip, tar, 7z) without extracting. Used to populate `installed_files` at install time.
+
+### Changed
+
+- **`collection install`** now classifies already-tracked mods into four buckets before
+  prompting: _new_, _needs update_ (collection is newer), _would downgrade_ (you have newer),
+  and _up to date_. The summary table shows each count separately. Only new mods and
+  needs-update mods are queued by default; `--overwrite` queues everything.
+- **`do_install`** gains an `auto_confirm` parameter. When `True`, conflict-folder confirmation
+  prompts are skipped and the install proceeds automatically. Used by `collection install`
+  so batch installs do not stall waiting for interactive input.
+- **`remove --purge`** now supports flat-install mods (those without a `folder_name`). If an
+  `installed_files` manifest exists, individual files are deleted one by one; missing files
+  are skipped gracefully. If neither `folder_name` nor `installed_files` is recorded, the
+  original error message and `--force-legacy-purge` advice are shown unchanged.
+
+### Internal
+
+- `_ver_is_newer` — version comparison helper used by `collection install`. Prefers
+  `packaging.version.Version` for correct PEP-440 ordering; falls back to `_norm_version`
+  string comparison when `packaging` is unavailable or the version string is non-standard.
+- MCP `remove_mod`: also cleans `plugin_files` rows for the removed mod and now records a
+  `remove` history entry.
 
 ---
 

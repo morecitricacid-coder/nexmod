@@ -29,7 +29,7 @@ from rich.table import Table
 from rich.progress import Progress, DownloadColumn, TransferSpeedColumn, BarColumn, TextColumn
 from rich.syntax import Syntax
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 console = Console()
 log = logging.getLogger("nexmod")
@@ -299,6 +299,7 @@ SCHEMA_MIGRATIONS: list = [
     ("002_load_order_active_profile", "ALTER TABLE load_order_state ADD COLUMN active_profile TEXT"),
     ("003_plugin_files", _migration_003_plugin_files),
     ("004_collections", _migration_004_collections),
+    ("005_mods_installed_files", "ALTER TABLE mods ADD COLUMN installed_files TEXT"),
 ]
 
 
@@ -1227,6 +1228,48 @@ def extract_archive(archive: Path, target_dir: Path):
         raise
 
 
+def _list_archive_files(archive: Path) -> list[str]:
+    """Return relative file paths inside an archive (files only, forward slashes).
+
+    Used to populate installed_files for mods that extract into a pre-existing
+    directory (e.g. SFSE plugins), where no new top-level folder is created and
+    folder_name cannot be determined from directory diffing alone.
+    """
+    n = archive.name.lower()
+    try:
+        if n.endswith(".zip"):
+            with zipfile.ZipFile(archive) as zf:
+                return sorted(
+                    m.filename.replace("\\", "/")
+                    for m in zf.infolist()
+                    if not m.is_dir() and m.file_size > 0
+                )
+        if any(n.endswith(e) for e in (".tar.gz", ".tgz", ".tar.bz2", ".tar.xz", ".tar")):
+            with tarfile.open(archive) as tf:
+                return sorted(m.name for m in tf.getmembers() if m.isfile())
+        if n.endswith(".7z"):
+            _7z = shutil.which("7z") or shutil.which("7zz") or shutil.which("7za")
+            if not _7z:
+                return []
+            out = subprocess.run(
+                [_7z, "l", str(archive)], capture_output=True, text=True
+            ).stdout
+            files, in_list = [], False
+            for line in out.splitlines():
+                if line.startswith("------"):
+                    in_list = not in_list
+                    continue
+                if not in_list:
+                    continue
+                parts = line.split(None, 5)
+                if len(parts) == 6 and parts[2] and parts[2][0] != "D":
+                    files.append(parts[5].replace("\\", "/"))
+            return sorted(files)
+    except Exception as exc:
+        log.debug("_list_archive_files failed for %s: %s", archive.name, exc)
+    return []
+
+
 # ── File Selection ────────────────────────────────────────────────────────────
 
 def pick_main_file(files: list) -> dict | None:
@@ -1606,7 +1649,8 @@ def do_install(game: str, mod_id: int, file_id_override: int | None,
                nxm_key: str | None = None,
                nxm_expires: str | None = None,
                nxm_user_id: str | None = None,
-               from_file: "Path | None" = None):
+               from_file: "Path | None" = None,
+               auto_confirm: bool = False):
     info   = GAMES.get(game)
     domain = info["domain"] if info else game
 
@@ -1706,7 +1750,9 @@ def do_install(game: str, mod_id: int, file_id_override: int | None,
                     f"  [yellow]{folder}/[/yellow] is owned by [cyan]{other_name}[/cyan] (mod {other_id})"
                 )
             console.print("  Continuing will overwrite those mods' files.")
-            if not click.confirm("Continue?", default=False):
+            if auto_confirm:
+                console.print("  [dim]Auto-confirming (batch install).[/dim]")
+            elif not click.confirm("Continue?", default=False):
                 console.print("[dim]Aborted.[/dim]")
                 record(db, "install", game, mod_id, mod["name"], mod.get("version"),
                        "skip", f"conflict with mods: {','.join(str(c[2]) for c in conflicts)}")
@@ -1747,6 +1793,17 @@ def do_install(game: str, mod_id: int, file_id_override: int | None,
         log.info("Multi-folder install for mod_id=%s: %s", mod_id, new_dirs)
     folder_name = new_dirs[0] if new_dirs else None
 
+    # For flat-install mods that extract into an existing directory (e.g. SFSE
+    # plugins landing in Data/SFSE/Plugins/), no new top-level dir is created so
+    # folder_name stays None. Record individual files from the archive so --purge
+    # can remove them later without guessing.
+    installed_files = None
+    if folder_name is None:
+        file_list = _list_archive_files(archive)
+        if file_list:
+            installed_files = json.dumps(file_list)
+            log.debug("flat-install: tracking %d file(s) for mod_id=%s", len(file_list), mod_id)
+
     # When installing from a local file the recorded filename is the actual
     # archive, not the API's canonical file_name (which may differ).
     recorded_filename = archive.name if from_file else chosen["file_name"]
@@ -1754,19 +1811,20 @@ def do_install(game: str, mod_id: int, file_id_override: int | None,
     db.execute("""
         INSERT INTO mods
             (game, mod_id, file_id, name, version, filename, mod_dir,
-             folder_name, tracked_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             folder_name, installed_files, tracked_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(game, mod_id) DO UPDATE SET
-            file_id     = excluded.file_id,
-            name        = excluded.name,
-            version     = excluded.version,
-            filename    = excluded.filename,
-            mod_dir     = excluded.mod_dir,
-            folder_name = COALESCE(excluded.folder_name, mods.folder_name),
-            updated_at  = excluded.updated_at
+            file_id         = excluded.file_id,
+            name            = excluded.name,
+            version         = excluded.version,
+            filename        = excluded.filename,
+            mod_dir         = excluded.mod_dir,
+            folder_name     = COALESCE(excluded.folder_name, mods.folder_name),
+            installed_files = COALESCE(excluded.installed_files, mods.installed_files),
+            updated_at      = excluded.updated_at
     """, (
         game, mod_id, chosen["file_id"], mod["name"], mod.get("version"),
-        recorded_filename, str(mod_dir), folder_name, now_iso(), now_iso(),
+        recorded_filename, str(mod_dir), folder_name, installed_files, now_iso(), now_iso(),
     ))
     db.commit()
     record(db, "install", game, mod_id, mod["name"], mod.get("version"), "ok")
@@ -5538,40 +5596,67 @@ def remove_mod(game, mod_id, purge, yes, force_legacy_purge, dry_run):
             used_legacy_fallback = True
 
         if not candidates:
-            console.print(
-                f"[yellow]Cannot purge:[/yellow] no recorded folder_name for [cyan]{row['name']}[/cyan]."
-            )
-            console.print(
-                "  Run [cyan]nexmod fsck[/cyan] to backfill, or pass "
-                "[cyan]--force-legacy-purge[/cyan] to use filename-stem inference (may delete the wrong folder)."
-            )
-            sys.exit(1)
-
-        target = mod_dir / candidates[0]
-        if not target.exists() or not target.is_dir():
-            console.print(
-                f"[yellow]Folder to purge not found:[/yellow] {target}\n"
-                "  Files may already be gone, or the folder was renamed."
-            )
-            # Fall through to DB removal — nothing on disk to delete.
+            # Flat-install fallback: mod has no folder_name but may have a per-file
+            # manifest (installed_files JSON). Delete each tracked file individually.
+            if row["installed_files"]:
+                file_list = json.loads(row["installed_files"])
+                targets = [mod_dir / f for f in file_list]
+                existing = [t for t in targets if t.exists() and t.is_file()]
+                if not existing:
+                    console.print(
+                        f"[yellow]Flat-install files already gone:[/yellow] {len(file_list)} tracked, 0 found on disk."
+                    )
+                else:
+                    console.print(
+                        f"[bold red]About to delete {len(existing)} file(s):[/bold red] "
+                        + ", ".join(t.name for t in existing[:5])
+                        + ("..." if len(existing) > 5 else "")
+                    )
+                    if dry_run:
+                        console.print("[dim](dry-run — no changes made)[/dim]")
+                        return
+                    if not yes and not click.confirm("Proceed?", default=False):
+                        console.print("[dim]Aborted.[/dim]")
+                        sys.exit(0)
+                    for t in existing:
+                        t.unlink()
+                        log.info("Purged flat-install file %s", t)
+                    console.print(f"[dim]Deleted {len(existing)} file(s)[/dim]")
+            else:
+                console.print(
+                    f"[yellow]Cannot purge:[/yellow] no recorded folder_name for [cyan]{row['name']}[/cyan]."
+                )
+                console.print(
+                    "  Run [cyan]nexmod fsck[/cyan] to backfill, or pass "
+                    "[cyan]--force-legacy-purge[/cyan] to use filename-stem inference (may delete the wrong folder)."
+                )
+                sys.exit(1)
         else:
-            warn = " [yellow](legacy fallback — verify before confirming)[/yellow]" if used_legacy_fallback else ""
-            console.print(f"[bold red]About to delete:[/bold red] {target}{warn}")
-            try:
-                file_count = sum(1 for _ in target.rglob("*"))
-                console.print(f"  [dim]{file_count} file(s) under that folder[/dim]")
-            except Exception:
-                pass
+            target = mod_dir / candidates[0]
+            if not target.exists() or not target.is_dir():
+                console.print(
+                    f"[yellow]Folder to purge not found:[/yellow] {target}\n"
+                    "  Files may already be gone, or the folder was renamed."
+                )
+                # Fall through to DB removal — nothing on disk to delete.
+            else:
+                warn = " [yellow](legacy fallback — verify before confirming)[/yellow]" if used_legacy_fallback else ""
+                console.print(f"[bold red]About to delete:[/bold red] {target}{warn}")
+                try:
+                    file_count = sum(1 for _ in target.rglob("*"))
+                    console.print(f"  [dim]{file_count} file(s) under that folder[/dim]")
+                except Exception:
+                    pass
 
-            if dry_run:
-                console.print("[dim](dry-run — no changes made)[/dim]")
-                return
-            if not yes and not click.confirm("Proceed?", default=False):
-                console.print("[dim]Aborted.[/dim]")
-                sys.exit(0)
-            shutil.rmtree(target)
-            log.info("Purged mod folder %s", target)
-            console.print(f"[dim]Deleted {target}[/dim]")
+                if dry_run:
+                    console.print("[dim](dry-run — no changes made)[/dim]")
+                    return
+                if not yes and not click.confirm("Proceed?", default=False):
+                    console.print("[dim]Aborted.[/dim]")
+                    sys.exit(0)
+                shutil.rmtree(target)
+                log.info("Purged mod folder %s", target)
+                console.print(f"[dim]Deleted {target}[/dim]")
 
     if dry_run:
         console.print(f"[dim](dry-run) Would untrack {row['name']} (mod_id={mod_id})[/dim]")
@@ -6525,12 +6610,15 @@ def collection_info(game, slug, as_json):
               help="Show what would be installed without downloading anything.")
 @click.option("--yes", is_flag=True,
               help="Skip confirmation prompt.")
-def collection_install(game, slug, revision, optional, dry_run, yes):
+@click.option("--overwrite", is_flag=True,
+              help="Reinstall mods that are already tracked (overwrite existing installs).")
+def collection_install(game, slug, revision, optional, dry_run, yes, overwrite):
     """Install all mods in a Nexus Collection.
 
     Required mods are always installed. Use --optional to include mods the
-    collection author marked as optional. Mods already tracked in the DB are
-    skipped. Failed mods are skipped with a warning — the rest continue.
+    collection author marked as optional. Already-tracked mods are skipped
+    unless --overwrite is passed. Failed mods are skipped with a warning —
+    the rest continue.
 
     Free-tier accounts cannot auto-download; use --dry-run to get the list,
     then install each mod manually via 'nexmod install <game> <id> --from-file'.
@@ -6564,13 +6652,49 @@ def collection_install(game, slug, revision, optional, dry_run, yes):
         if mf.get("optional") and not optional
     ]
 
-    # ── Check which are already installed ────────────────────────────────────
-    already_ids = {
-        row["mod_id"]
-        for row in db.execute("SELECT mod_id FROM mods WHERE game = ?", (game,)).fetchall()
+    # ── Check which are already installed, split by version match ────────────
+    tracked = {
+        row["mod_id"]: row["version"]
+        for row in db.execute("SELECT mod_id, version FROM mods WHERE game = ?", (game,)).fetchall()
     }
-    pending = [mf for mf in to_install if mf["file"]["modId"] not in already_ids]
-    already_in_db = [mf for mf in to_install if mf["file"]["modId"] in already_ids]
+
+    def _ver_is_newer(col_ver: str, tracked_ver: str) -> bool:
+        """Return True if the collection version is strictly newer than tracked.
+
+        Uses `packaging.version.Version` for correct semantic comparison when
+        available (it is a transitive dep of pip/setuptools so almost always
+        present). Falls back to normalised string comparison via _norm_version,
+        which handles "1.0" == "1.00" == "1" but cannot order segments numerically
+        (e.g. "1.9" vs "1.10"). Acceptable as a fallback.
+        """
+        try:
+            from packaging.version import Version
+            return Version(col_ver) > Version(tracked_ver)
+        except Exception:
+            # packaging unavailable or version strings are non-PEP-440.
+            # Treat any difference in normalised form as "newer" so the user at
+            # least sees the candidate rather than silently skipping it.
+            return _norm_version(col_ver) != _norm_version(tracked_ver)
+
+    new_mods        = [mf for mf in to_install if mf["file"]["modId"] not in tracked]
+    needs_update    = [mf for mf in to_install
+                       if mf["file"]["modId"] in tracked
+                       and _ver_is_newer(mf["file"].get("version") or "",
+                                         tracked[mf["file"]["modId"]] or "")]
+    would_downgrade = [mf for mf in to_install
+                       if mf["file"]["modId"] in tracked
+                       and not _ver_is_newer(mf["file"].get("version") or "",
+                                             tracked[mf["file"]["modId"]] or "")
+                       and tracked[mf["file"]["modId"]] != mf["file"].get("version")]
+    up_to_date      = [mf for mf in to_install
+                       if mf["file"]["modId"] in tracked
+                       and tracked[mf["file"]["modId"]] == mf["file"].get("version")]
+
+    # version_diff always queued; up_to_date only when --overwrite
+    if overwrite:
+        pending = list(to_install)
+    else:
+        pending = new_mods + needs_update
 
     # ── Premium check ─────────────────────────────────────────────────────────
     try:
@@ -6583,11 +6707,28 @@ def collection_install(game, slug, revision, optional, dry_run, yes):
     console.print(f"\n[bold]Collection:[/bold] {col_name}")
     console.print(f"  Author:   {author}")
     console.print(f"  Revision: {rev_num}")
-    console.print(f"  Mods to install:  [cyan]{len(pending)}[/cyan]")
-    if already_in_db:
+    console.print(f"  New mods:         [cyan]{len(new_mods)}[/cyan]")
+    if needs_update:
         console.print(
-            f"  Already tracked:  [dim]{len(already_in_db)} (will be skipped)[/dim]"
+            f"  Needs update:     [yellow]{len(needs_update)} (collection has newer version)[/yellow]"
         )
+    if would_downgrade:
+        console.print(
+            f"  Would downgrade:  [dim]{len(would_downgrade)} skipped "
+            f"(you have newer — use --overwrite to force)[/dim]"
+        )
+    if up_to_date:
+        if overwrite:
+            console.print(
+                f"  Up to date:       [yellow]{len(up_to_date)} (forced overwrite)[/yellow]"
+            )
+        else:
+            console.print(
+                f"  Up to date:       [dim]{len(up_to_date)} skipped (use --overwrite to force)[/dim]"
+            )
+    console.print(f"  Total to install: [bold cyan]{len(pending)}[/bold cyan]")
+    # keep already_in_db for DB recording after install
+    already_in_db = needs_update + would_downgrade + up_to_date
     if skipped_optional:
         console.print(
             f"  Optional skipped: [dim]{len(skipped_optional)} "
@@ -6650,7 +6791,7 @@ def collection_install(game, slug, revision, optional, dry_run, yes):
         )
 
         try:
-            do_install(game, mod_id, file_id, api_key, db)
+            do_install(game, mod_id, file_id, api_key, db, auto_confirm=True)
             installed.append(mod_id)
         except SystemExit:
             # do_install calls sys.exit(1) on certain hard failures.

@@ -159,7 +159,7 @@ Install a curated Nexus Collection in one command. A Collection is a set of mods
 | Command | Flags | Description |
 |---------|-------|-------------|
 | `nexmod collection info <game> <slug>` | `--json` | Show collection metadata: name, author, revision, mod count, description, endorsements, download count. |
-| `nexmod collection install <game> <slug>` | `--revision N`, `--optional`, `--dry-run`, `--yes` | Install all required mods in the collection. `--optional` also installs mods the collection author marked optional. `--dry-run` prints the mod list without downloading. Mods already in the DB are skipped. Failed mods are skipped with a warning; the rest continue. Free accounts: mods that require Premium are queued for manual install and listed at the end. **Requires Premium** for automatic downloads. |
+| `nexmod collection install <game> <slug>` | `--revision N`, `--optional`, `--dry-run`, `--yes`, `--overwrite` | Install all required mods in the collection. `--optional` also installs mods the collection author marked optional. `--dry-run` prints the mod list without downloading. Mods at the same version are skipped; mods the collection has in a newer version are updated automatically. `--overwrite` forces reinstall of everything including mods you already have at the same or newer version. Failed mods are skipped with a warning; the rest continue. Free accounts: mods that require Premium are queued for manual install and listed at the end. **Requires Premium** for automatic downloads. |
 | `nexmod collection list <game>` | `--available`, `--count N` (1–50), `--json` | Without `--available`: lists locally installed collections. With `--available`: queries Nexus for published collections for this game (sorted by downloads). |
 
 ### Updates

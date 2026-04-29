@@ -414,7 +414,7 @@ class TestCollectionInstallHappyPath:
 
         install_called_with = []
 
-        def fake_install(game, mod_id, file_id, api_key, db_conn):
+        def fake_install(game, mod_id, file_id, api_key, db_conn, **kwargs):
             install_called_with.append((game, mod_id, file_id))
 
         monkeypatch.setattr(nexmod, "do_install", fake_install)
@@ -490,7 +490,7 @@ class TestCollectionInstallFailureHandling:
 
         installed = []
 
-        def fake_install(game, mod_id, file_id, api_key, db_conn):
+        def fake_install(game, mod_id, file_id, api_key, db_conn, **kwargs):
             if mod_id == 20:
                 raise RuntimeError("something went wrong")
             installed.append(mod_id)
@@ -520,7 +520,7 @@ class TestCollectionInstallFailureHandling:
 
         installed = []
 
-        def fake_install(game, mod_id, file_id, api_key, db_conn):
+        def fake_install(game, mod_id, file_id, api_key, db_conn, **kwargs):
             if mod_id == 10:
                 sys.exit(1)
             installed.append(mod_id)

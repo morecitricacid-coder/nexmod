@@ -262,17 +262,41 @@ def remove_mod(game: str, mod_id: int, purge: bool = False) -> dict:
         raise RuntimeError(
             f"Mod {mod_id} is not tracked for '{game}'."
         )
+    import json as _json
     name = row["name"]
+    version = row["version"]
     purged = False
-    if purge and row["mod_dir"] and row["folder_name"]:
-        target = _nm.Path(row["mod_dir"]) / row["folder_name"]
-        if target.exists():
-            shutil.rmtree(target)
-            purged = True
+    if purge and row["mod_dir"]:
+        mod_dir = _nm.Path(row["mod_dir"])
+        if row["folder_name"]:
+            # Folder-based install: delete the tracked top-level folder.
+            target = mod_dir / row["folder_name"]
+            if target.exists():
+                shutil.rmtree(target)
+                purged = True
+        elif row["installed_files"]:
+            # Flat-install (e.g. SFSE plugins): delete individual tracked files.
+            file_list = _json.loads(row["installed_files"])
+            deleted = 0
+            for rel in file_list:
+                f = mod_dir / rel
+                if f.exists() and f.is_file():
+                    f.unlink()
+                    deleted += 1
+            purged = deleted > 0
+        else:
+            raise RuntimeError(
+                f"Cannot purge '{name}': no folder_name or installed_files recorded. "
+                "Reinstall the mod and remove again, or delete the files manually."
+            )
     db.execute(
         "DELETE FROM mods WHERE game=? AND mod_id=?", (game, mod_id)
     )
+    db.execute(
+        "DELETE FROM plugin_files WHERE game=? AND mod_id=?", (game, mod_id)
+    )
     db.commit()
+    _nm.record(db, "remove", game, mod_id, name, version, "ok")
     return {"mod_id": mod_id, "name": name, "status": "removed", "purged": purged}
 
 
