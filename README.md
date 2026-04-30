@@ -25,7 +25,7 @@ A Linux-native CLI mod manager for [Nexus Mods](https://www.nexusmods.com/).
 - **Conflict detection** — peeks archives before extracting; warns when a mod would overwrite another tracked mod's folder
 - **Network resilience** — Range-resume on download interruption, retries with exponential backoff, honors `Retry-After` on 429, falls back across CDN mirrors
 - **Pre-flight `nexmod doctor`** — verifies API + Premium + Steam + dtkit-patch + 7z + disk + DB before you install anything
-- **`nexmod fsck`** — audits and repairs DB drift (legacy rows missing `folder_name`, version mismatches); `--scan` detects untracked folders in the mod directory and offers to track them
+- **`nexmod fsck`** — audits and repairs DB drift (legacy rows missing `folder_name`, version mismatches); `--scan` detects untracked folders in the mod directory; `--with-api` backfills `installed_files` for flat-layout legacy mods so `remove --purge` works on them
 - **`nexmod import`** — install a locally-downloaded archive without Premium; auto-detects mod ID from Nexus filename convention
 - Vortex import — reads `vortex.deployment.json`, no re-downloads
 - Steam (native + Flatpak) and Wine/Proton paths auto-detected
@@ -272,7 +272,7 @@ launches nexmod and starts the install. Free users: the button still triggers ne
 | Command | Flags | Description |
 |---------|-------|-------------|
 | `nexmod doctor` | `--game <slug>` | Pre-flight environment check: API key + Premium, Steam libraries, per-game install paths, dtkit-patch + 7z presence, disk space, DB integrity. Exits 1 if any required check fails; warnings are advisory. |
-| `nexmod fsck [<game>]` | `--fix`, `--with-api`, `--scan` | Audit the local DB. Reports legacy rows missing `folder_name` and version. With `--fix`, auto-backfills folder names. With `--with-api --fix`, also re-fetches missing version strings from Nexus. With `--scan`, walks the mod folder for subdirectories not in the DB and offers to track them (requires game argument + API key). |
+| `nexmod fsck [<game>]` | `--fix`, `--with-api`, `--scan` | Audit the local DB. Reports legacy rows missing `folder_name` and version. With `--fix`, auto-backfills folder names. With `--with-api --fix`, also re-fetches missing version strings from Nexus AND backfills `installed_files` for flat-layout legacy mods (downloads each archive to a temp file, reads its manifest, then deletes the temp; requires Premium). With `--scan`, walks the mod folder for subdirectories not in the DB and offers to track them (requires game argument + API key). |
 | `nexmod path set <game> <dir>` | — | Override auto-detected mod directory. |
 | `nexmod path show <game>` | — | Print the resolved mod directory. |
 | `nexmod diag <game>` | `--lines N`, `--all` | Surface mod errors from the game's own log file. |

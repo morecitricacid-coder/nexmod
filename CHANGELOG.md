@@ -6,6 +6,21 @@ All notable changes to nexmod are documented here. Format follows
 
 ---
 
+## [Unreleased]
+
+### Added
+
+- **`fsck --fix --with-api` backfills `installed_files` for flat-layout legacy mods** — mods
+  installed before v1.2.0 that extract files directly into an existing directory (e.g.
+  Starfield `Data/`) have no `folder_name` and no file manifest, making `remove --purge`
+  impossible. With `--with-api`, `fsck` now downloads each such archive to a temp file,
+  reads its file manifest via `_list_archive_files`, writes the JSON manifest to the
+  `installed_files` column, and immediately deletes the temp file. After backfilling,
+  `remove --purge` works on those mods. Requires a Premium Nexus account (archive
+  download URLs are Premium-gated). Non-Premium mods are skipped with a clear message.
+
+---
+
 ## [1.2.0] — 2026-04-29
 
 ### Added

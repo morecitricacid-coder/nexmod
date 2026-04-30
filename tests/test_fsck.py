@@ -355,3 +355,251 @@ def test_fsck_scan_mod_dir_missing(tmp_path, runner):
     result = runner.invoke(cli, ["fsck", "darktide", "--scan"])
     assert result.exit_code == 0
     assert "does not exist" in result.output.lower() or "not exist" in result.output.lower()
+
+
+# ── fsck --fix --with-api (installed_files backfill) ─────────────────────────
+
+def _seed_flat_orphan(mod_dir: Path, **overrides):
+    """Insert a flat-layout legacy row: folder_name=NULL, installed_files=NULL."""
+    db = nexmod.get_db()
+    fields = {
+        "game": "starfield", "mod_id": 100, "file_id": 200,
+        "name": "Better Loading", "version": "1.0",
+        "filename": "BetterLoading-100-200-1.0.zip",
+        "mod_dir": str(mod_dir),
+        "folder_name": None,
+    }
+    fields.update(overrides)
+    db.execute("""
+        INSERT INTO mods (game, mod_id, file_id, name, version, filename,
+                          mod_dir, folder_name, tracked_at, updated_at)
+        VALUES (?,?,?,?,?,?,?,?,?,?)
+    """, (
+        fields["game"], fields["mod_id"], fields["file_id"], fields["name"],
+        fields["version"], fields["filename"], fields["mod_dir"],
+        fields["folder_name"], nexmod.now_iso(), nexmod.now_iso(),
+    ))
+    db.commit()
+    db.close()
+
+
+_FAKE_FILE_LIST = ["Data/BetterLoading.esm", "Data/BetterLoading.ba2"]
+_FAKE_NEXUS_FILES = [{"file_id": 200, "file_name": "BetterLoading-100-200-1.0.zip",
+                      "category_name": "MAIN", "size_kb": 512,
+                      "uploaded_timestamp": 1}]
+_FAKE_DOWNLOAD_URLS = [{"URI": "https://cdn.example.com/BetterLoading.zip",
+                        "short_name": "cdn1"}]
+
+
+def test_fsck_with_api_backfills_installed_files(tmp_path, runner):
+    """--fix --with-api downloads archive + writes installed_files for flat-layout mods."""
+    nexmod.CONFIG_FILE.write_text(json.dumps({"api_key": "FAKEKEY000"}))
+    mod_dir = tmp_path / "starfield" / "Data"
+    mod_dir.mkdir(parents=True)
+    _seed_flat_orphan(mod_dir)
+
+    with (
+        patch("nexmod.api_mod_files", return_value=_FAKE_NEXUS_FILES),
+        patch("nexmod.api_download_urls", return_value=_FAKE_DOWNLOAD_URLS),
+        patch("nexmod._try_download_with_mirrors"),
+        patch("nexmod._list_archive_files", return_value=_FAKE_FILE_LIST),
+    ):
+        result = runner.invoke(cli, ["fsck", "starfield", "--fix", "--with-api"])
+
+    assert result.exit_code == 0
+    assert "installed_files" in result.output
+
+    db = nexmod.get_db()
+    row = db.execute(
+        "SELECT installed_files FROM mods WHERE game='starfield' AND mod_id=100"
+    ).fetchone()
+    assert row is not None
+    assert row["installed_files"] is not None
+    stored = json.loads(row["installed_files"])
+    assert stored == _FAKE_FILE_LIST
+
+
+def test_fsck_with_api_skips_no_premium(tmp_path, runner):
+    """--fix --with-api skips mods when Premium is required (api_download_urls exits 1)."""
+    nexmod.CONFIG_FILE.write_text(json.dumps({"api_key": "FAKEKEY000"}))
+    mod_dir = tmp_path / "starfield" / "Data"
+    mod_dir.mkdir(parents=True)
+    _seed_flat_orphan(mod_dir)
+
+    def _download_urls_raises(*args, **kwargs):
+        raise SystemExit(1)
+
+    with (
+        patch("nexmod.api_mod_files", return_value=_FAKE_NEXUS_FILES),
+        patch("nexmod.api_download_urls", side_effect=_download_urls_raises),
+        patch("nexmod._list_archive_files") as mock_list,
+    ):
+        result = runner.invoke(cli, ["fsck", "starfield", "--fix", "--with-api"])
+
+    # _list_archive_files must NOT be called (no download happened)
+    mock_list.assert_not_called()
+    assert result.exit_code == 0
+    # Should mention Premium skip
+    assert "Premium" in result.output or "premium" in result.output.lower()
+
+    # installed_files should still be NULL
+    db = nexmod.get_db()
+    row = db.execute(
+        "SELECT installed_files FROM mods WHERE game='starfield' AND mod_id=100"
+    ).fetchone()
+    assert row["installed_files"] is None
+
+
+def test_fsck_with_api_skips_already_populated(tmp_path, runner):
+    """--fix --with-api does not re-download mods that already have installed_files."""
+    nexmod.CONFIG_FILE.write_text(json.dumps({"api_key": "FAKEKEY000"}))
+    mod_dir = tmp_path / "starfield" / "Data"
+    mod_dir.mkdir(parents=True)
+    _seed_flat_orphan(mod_dir)
+
+    # Manually set installed_files on the row before invoking fsck
+    db = nexmod.get_db()
+    existing = json.dumps(["Data/Existing.esm"])
+    db.execute(
+        "UPDATE mods SET installed_files = ? WHERE game='starfield' AND mod_id=100",
+        (existing,),
+    )
+    db.commit()
+    db.close()
+
+    with (
+        patch("nexmod.api_mod_files") as mock_files,
+        patch("nexmod.api_download_urls") as mock_urls,
+        patch("nexmod._try_download_with_mirrors") as mock_dl,
+    ):
+        result = runner.invoke(cli, ["fsck", "starfield", "--fix", "--with-api"])
+
+    # Row already has installed_files — should not hit API at all
+    mock_files.assert_not_called()
+    mock_urls.assert_not_called()
+    mock_dl.assert_not_called()
+    assert result.exit_code == 0
+
+
+def test_fsck_with_api_skips_row_with_folder_name(tmp_path, runner):
+    """--fix --with-api does not touch mods that already have folder_name."""
+    nexmod.CONFIG_FILE.write_text(json.dumps({"api_key": "FAKEKEY000"}))
+    mod_dir = tmp_path / "starfield" / "Data"
+    mod_dir.mkdir(parents=True)
+    # Insert a row WITH folder_name (not a flat-layout orphan)
+    _seed_flat_orphan(mod_dir, folder_name="BetterLoadingFolder")
+
+    with (
+        patch("nexmod.api_mod_files") as mock_files,
+        patch("nexmod.api_download_urls") as mock_urls,
+        patch("nexmod._try_download_with_mirrors") as mock_dl,
+    ):
+        result = runner.invoke(cli, ["fsck", "starfield", "--fix", "--with-api"])
+
+    mock_files.assert_not_called()
+    mock_urls.assert_not_called()
+    mock_dl.assert_not_called()
+    assert result.exit_code == 0
+
+
+def test_fsck_with_api_empty_manifest_skipped(tmp_path, runner):
+    """--fix --with-api skips mods whose archive yields an empty file list."""
+    nexmod.CONFIG_FILE.write_text(json.dumps({"api_key": "FAKEKEY000"}))
+    mod_dir = tmp_path / "starfield" / "Data"
+    mod_dir.mkdir(parents=True)
+    _seed_flat_orphan(mod_dir)
+
+    with (
+        patch("nexmod.api_mod_files", return_value=_FAKE_NEXUS_FILES),
+        patch("nexmod.api_download_urls", return_value=_FAKE_DOWNLOAD_URLS),
+        patch("nexmod._try_download_with_mirrors"),
+        patch("nexmod._list_archive_files", return_value=[]),
+    ):
+        result = runner.invoke(cli, ["fsck", "starfield", "--fix", "--with-api"])
+
+    assert result.exit_code == 0
+    # installed_files must remain NULL
+    db = nexmod.get_db()
+    row = db.execute(
+        "SELECT installed_files FROM mods WHERE game='starfield' AND mod_id=100"
+    ).fetchone()
+    assert row["installed_files"] is None
+
+
+def test_fsck_with_api_no_flat_orphans_no_download(tmp_path, runner):
+    """--fix --with-api when all mods have folder_name — no archive download triggered."""
+    nexmod.CONFIG_FILE.write_text(json.dumps({"api_key": "FAKEKEY000"}))
+    mod_dir = tmp_path / "darktide" / "mods"
+    (mod_dir / "HubHotkeys").mkdir(parents=True)
+    _seed_legacy_row(mod_dir, folder_name="HubHotkeys")
+
+    with (
+        patch("nexmod.api_mod_files") as mock_files,
+        patch("nexmod.api_download_urls") as mock_urls,
+    ):
+        result = runner.invoke(cli, ["fsck", "darktide", "--fix", "--with-api"])
+
+    mock_files.assert_not_called()
+    mock_urls.assert_not_called()
+    assert result.exit_code == 0
+
+
+def test_fsck_with_api_api_error_skipped(tmp_path, runner):
+    """--fix --with-api gracefully skips mods when api_mod_files returns an error."""
+    nexmod.CONFIG_FILE.write_text(json.dumps({"api_key": "FAKEKEY000"}))
+    mod_dir = tmp_path / "starfield" / "Data"
+    mod_dir.mkdir(parents=True)
+    _seed_flat_orphan(mod_dir)
+
+    with (
+        patch("nexmod.api_mod_files", side_effect=SystemExit(1)),
+        patch("nexmod._try_download_with_mirrors") as mock_dl,
+    ):
+        result = runner.invoke(cli, ["fsck", "starfield", "--fix", "--with-api"])
+
+    mock_dl.assert_not_called()
+    assert result.exit_code == 0
+    # installed_files still NULL
+    db = nexmod.get_db()
+    row = db.execute(
+        "SELECT installed_files FROM mods WHERE game='starfield' AND mod_id=100"
+    ).fetchone()
+    assert row["installed_files"] is None
+
+
+def test_fsck_with_api_multiple_mods_partial_success(tmp_path, runner):
+    """--fix --with-api backfills some mods and skips others in same run."""
+    nexmod.CONFIG_FILE.write_text(json.dumps({"api_key": "FAKEKEY000"}))
+    mod_dir = tmp_path / "starfield" / "Data"
+    mod_dir.mkdir(parents=True)
+    # Two flat-orphan rows
+    _seed_flat_orphan(mod_dir, mod_id=100, file_id=200, name="ModA")
+    _seed_flat_orphan(mod_dir, mod_id=101, file_id=201, name="ModB")
+
+    call_count = {"n": 0}
+
+    def _files_side_effect(domain, mod_id, api_key):
+        call_count["n"] += 1
+        if mod_id == 101:
+            raise SystemExit(1)  # simulate 404 for ModB
+        return [{"file_id": 200, "file_name": "ModA.zip",
+                 "category_name": "MAIN", "size_kb": 1, "uploaded_timestamp": 1}]
+
+    with (
+        patch("nexmod.api_mod_files", side_effect=_files_side_effect),
+        patch("nexmod.api_download_urls", return_value=_FAKE_DOWNLOAD_URLS),
+        patch("nexmod._try_download_with_mirrors"),
+        patch("nexmod._list_archive_files", return_value=["Data/ModA.esm"]),
+    ):
+        result = runner.invoke(cli, ["fsck", "starfield", "--fix", "--with-api"])
+
+    assert result.exit_code == 0
+    db = nexmod.get_db()
+    row_a = db.execute(
+        "SELECT installed_files FROM mods WHERE game='starfield' AND mod_id=100"
+    ).fetchone()
+    row_b = db.execute(
+        "SELECT installed_files FROM mods WHERE game='starfield' AND mod_id=101"
+    ).fetchone()
+    assert row_a["installed_files"] is not None  # ModA backfilled
+    assert row_b["installed_files"] is None       # ModB skipped

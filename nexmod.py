@@ -5734,8 +5734,11 @@ def uninstall_mod(ctx, game, mod_id, yes):
 @click.argument("game", required=False)
 @click.option("--fix", is_flag=True, help="Apply fixes (default: dry-run report only).")
 @click.option("--with-api", is_flag=True,
-              help="Also re-fetch missing version strings from Nexus API "
-                   "(requires --fix; one API call per NULL-version row).")
+              help="Also re-fetch missing data from Nexus API (requires --fix). "
+                   "Fixes NULL version strings (one API call each) AND backfills "
+                   "installed_files for flat-layout mods with no folder_name — "
+                   "requires Premium (downloads each archive to a temp file, "
+                   "reads its manifest, then deletes the temp file).")
 @click.option("--scan", is_flag=True,
               help="Detect subdirectories in the mod folder not tracked in the DB, "
                    "and offer to track them (requires GAME argument and an API key).")
@@ -5860,27 +5863,157 @@ def fsck(game, fix, with_api, scan):
         applied_folders += 1
 
     applied_versions = 0
-    if with_api and null_version:
+    applied_installed_files = 0
+    skipped_no_premium = 0
+    skipped_api_error = 0
+
+    if with_api:
         api_key = get_api_key()
-        with console.status(f"Re-fetching {len(null_version)} version(s)..."):
-            for r in null_version:
-                info = GAMES.get(r["game"], {})
-                domain = info.get("domain", r["game"])
+
+        # ── (A) Backfill missing version strings ──────────────────────────────
+        if null_version:
+            with console.status(f"Re-fetching {len(null_version)} version(s)..."):
+                for r in null_version:
+                    _info = GAMES.get(r["game"], {})
+                    domain = _info.get("domain", r["game"])
+                    try:
+                        mod = api_mod_info(domain, r["mod_id"], api_key)
+                        latest = mod.get("version")
+                        if latest:
+                            db.execute("UPDATE mods SET version = ? WHERE id = ?",
+                                       (latest, r["id"]))
+                            applied_versions += 1
+                    except Exception as e:
+                        log.warning("fsck: version refetch failed for %s: %s",
+                                    r["name"], e)
+
+        # ── (B) Backfill installed_files for flat-layout legacy mods ─────────
+        # Targets: rows where folder_name IS NULL AND installed_files IS NULL.
+        # These are mods installed before v1.2.0 that extract into an existing
+        # directory (e.g. Starfield Data/) rather than creating their own folder.
+        # Strategy: download the archive to a temp file, read its file manifest,
+        # write JSON to installed_files, delete the temp file immediately.
+        # Requires Premium (api_download_urls is Premium-gated).
+        flat_orphans = [
+            r for r in rows
+            if r["folder_name"] is None and not r["installed_files"]
+        ]
+        if flat_orphans:
+            console.print(
+                f"\n[bold]--with-api:[/bold] backfilling installed_files for "
+                f"[yellow]{len(flat_orphans)}[/yellow] flat-layout mod(s) — "
+                f"this will download each archive to a temp file."
+            )
+            for r in flat_orphans:
+                _info = GAMES.get(r["game"], {})
+                domain = _info.get("domain", r["game"])
                 try:
-                    mod = api_mod_info(domain, r["mod_id"], api_key)
-                    latest = mod.get("version")
-                    if latest:
-                        db.execute("UPDATE mods SET version = ? WHERE id = ?", (latest, r["id"]))
-                        applied_versions += 1
+                    files = api_mod_files(domain, r["mod_id"], api_key)
+                    if not files:
+                        log.debug("fsck backfill: no files returned for %s", r["name"])
+                        skipped_api_error += 1
+                        continue
+
+                    # Pick the file matching the tracked version, or fall back
+                    # to the MAIN category pick.
+                    chosen = None
+                    if r["file_id"]:
+                        chosen = next(
+                            (f for f in files if f.get("file_id") == r["file_id"]),
+                            None,
+                        )
+                    if chosen is None:
+                        chosen = pick_main_file(files)
+                    if chosen is None:
+                        chosen = files[0] if files else None
+                    if chosen is None:
+                        skipped_api_error += 1
+                        continue
+
+                    # Download URLs — Premium-gated. 403 means free account.
+                    try:
+                        urls = api_download_urls(domain, r["mod_id"],
+                                                 chosen["file_id"], api_key)
+                    except SystemExit:
+                        # nexus_get calls sys.exit(1) on 403/401/404.
+                        # A 403 here means Premium required.
+                        skipped_no_premium += 1
+                        log.debug("fsck backfill: Premium required for %s — skipped",
+                                  r["name"])
+                        console.print(
+                            f"  [dim]Skipped (Premium required): {r['name']}[/dim]"
+                        )
+                        continue
+
+                    if not urls:
+                        skipped_api_error += 1
+                        continue
+
+                    # Download to a temp file, list archive contents, clean up.
+                    suffix = Path(chosen.get("file_name", "archive.zip")).suffix or ".zip"
+                    with tempfile.NamedTemporaryFile(
+                        suffix=suffix, delete=False, prefix=".nexmod-fsck-"
+                    ) as tmp_f:
+                        tmp_path_fsck = Path(tmp_f.name)
+
+                    try:
+                        with console.status(
+                            f"  Downloading {r['name']} "
+                            f"({chosen.get('size_kb', '?')} KB)..."
+                        ):
+                            _try_download_with_mirrors(urls, tmp_path_fsck)
+
+                        file_list = _list_archive_files(tmp_path_fsck)
+                    finally:
+                        tmp_path_fsck.unlink(missing_ok=True)
+
+                    if not file_list:
+                        log.warning("fsck backfill: empty manifest for %s — skipped",
+                                    r["name"])
+                        skipped_api_error += 1
+                        continue
+
+                    db.execute(
+                        "UPDATE mods SET installed_files = ? WHERE id = ?",
+                        (json.dumps(file_list), r["id"]),
+                    )
+                    applied_installed_files += 1
+                    log.info("fsck backfill: wrote %d file(s) for %s",
+                             len(file_list), r["name"])
+                    console.print(
+                        f"  [green]✓[/green] {r['name']} — "
+                        f"{len(file_list)} file(s) tracked"
+                    )
+
+                except SystemExit:
+                    # Other hard API failures (404 mod not found, etc.)
+                    skipped_api_error += 1
+                    log.debug("fsck backfill: API error for %s", r["name"])
                 except Exception as e:
-                    log.warning("fsck: version refetch failed for %s: %s", r["name"], e)
+                    skipped_api_error += 1
+                    log.warning("fsck backfill: error for %s: %s", r["name"], e)
+                    console.print(
+                        f"  [yellow]Error for {r['name']}: {e}[/yellow]"
+                    )
 
     db.commit()
     console.print(
-        f"\n[green]Applied:[/green] {applied_folders} folder_name, {applied_versions} version"
+        f"\n[green]Applied:[/green] {applied_folders} folder_name, "
+        f"{applied_versions} version, "
+        f"{applied_installed_files} installed_files"
     )
+    if skipped_no_premium:
+        console.print(
+            f"  [yellow]Skipped {skipped_no_premium} mod(s) — Premium account required "
+            f"for archive downloads.[/yellow]"
+        )
+    if skipped_api_error:
+        console.print(
+            f"  [dim]Skipped {skipped_api_error} mod(s) — API error or no files found.[/dim]"
+        )
     record(db, "fsck", game or "*", None, None, None, "ok",
-           f"folder_name={applied_folders} version={applied_versions}")
+           f"folder_name={applied_folders} version={applied_versions} "
+           f"installed_files={applied_installed_files}")
 
     # ── --scan: detect untracked folders ─────────────────────────────────────
     if scan:
