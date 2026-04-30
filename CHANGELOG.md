@@ -10,6 +10,8 @@ All notable changes to nexmod are documented here. Format follows
 
 ### Added
 
+- **`games --json`** — machine-readable JSON output listing all supported game slugs with
+  name, Nexus domain, and Steam ID. Completes the LLM-readable CLI surface.
 - **`fsck --fix --with-api` backfills `installed_files` for flat-layout legacy mods** — mods
   installed before v1.2.0 that extract files directly into an existing directory (e.g.
   Starfield `Data/`) have no `folder_name` and no file manifest, making `remove --purge`

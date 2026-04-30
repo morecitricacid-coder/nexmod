@@ -3614,8 +3614,14 @@ def path_show(game):
 # games ───────────────────────────────────────────────────────────────────────
 
 @cli.command("games")
-def games_list():
+@click.option("--json", "as_json", is_flag=True, help="Emit machine-readable JSON.")
+def games_list(as_json):
     """List built-in game profiles."""
+    if as_json:
+        import json as _json
+        print(_json.dumps({slug: {"name": info["name"], "domain": info["domain"],
+                                  "steam_id": info["steam_id"]} for slug, info in GAMES.items()}, indent=2))
+        return
     t = Table(title="Supported Games", show_lines=False)
     t.add_column("slug", style="bold cyan")
     t.add_column("name")
