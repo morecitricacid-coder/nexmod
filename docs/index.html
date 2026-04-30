@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>nexmod — Nexus Mods manager for Linux</title>
-<meta name="description" content="Vortex doesn't run on Linux. nexmod does. Search, install, update, and rollback Nexus mods from the terminal. JSON output for LLM agents and scripts. Premium required.">
+<meta name="description" content="Vortex doesn't run on Linux. nexmod does. Search, install, update, and rollback Nexus mods from the terminal. Free accounts can use nexmod import; Premium unlocks direct API downloads. JSON output for LLM agents and scripts.">
 <meta property="og:title" content="nexmod — Nexus Mods manager for Linux">
 <meta property="og:description" content="Install, update, and hotswap mod profiles from the terminal. No Wine-wrapped GUI.">
 <meta property="og:type" content="website">
@@ -546,6 +546,21 @@ footer{
     </div>
 
     <div class="feat">
+      <span class="feat-icon">&#9636;</span>
+      <div class="feat-title">Collections</div>
+      <div class="feat-desc">
+        Install an entire curated Nexus Collection in one command. nexmod checks what
+        you already have, skips up-to-date mods, and queues only the new or stale ones.
+        Browse published collections per game or list the ones you have installed.
+      </div>
+      <div class="feat-tags">
+        <span class="ftag">nexmod collection install darktide xktihh</span>
+        <span class="ftag">--dry-run</span>
+        <span class="ftag">nexmod collection list darktide --available</span>
+      </div>
+    </div>
+
+    <div class="feat">
       <span class="feat-icon">&#9889;</span>
       <div class="feat-title">MCP server</div>
       <div class="feat-desc">
@@ -606,6 +621,15 @@ footer{
       <span class="cbadge bu">⊘ Untested</span>
       <span class="compat-note">
         Install/update pipeline wired. Needs community testing.
+      </span>
+    </div>
+    <div class="compat-row">
+      <span class="compat-game">Starfield</span>
+      <span class="cbadge bu">⊘ Untested</span>
+      <span class="compat-note">
+        Install/update pipeline wired. Plugin tracking via <code>Plugins.txt</code>
+        (auto-detected from Proton prefix). <code>plugin-enable</code> / <code>plugin-disable</code>
+        / <code>plugin-order</code> commands available. Needs community verification.
       </span>
     </div>
     <div class="compat-row">

@@ -48,6 +48,7 @@ A Linux-native CLI mod manager for [Nexus Mods](https://www.nexusmods.com/).
 | Baldur's Gate 3 | `bg3` | — | — |
 | Cyberpunk 2077 | `cyberpunk2077` | — | — |
 | Fallout 4 | `fallout4` | — | — |
+| Starfield | `starfield` | `plugins.txt` | — |
 
 Unknown games still work for download/extract — pass any Nexus domain and set the mod dir manually with `nexmod path set`.
 
@@ -178,7 +179,7 @@ Install a curated Nexus Collection in one command. A Collection is a set of mods
 | `nexmod info <game> <mod_id>` | `--remote` | Local DB row + one Nexus call: author, version, deps, install date. `--remote` fetches from Nexus without requiring the mod to be tracked — useful before installing. |
 | `nexmod history [game]` | `--limit N`, `--failures` | Operation history. |
 | `nexmod logs` | `--lines N`, `--errors`, `--follow` | Tail nexmod's own log. |
-| `nexmod games` | — | List built-in game slugs. |
+| `nexmod games` | `--json` | List built-in game slugs. `--json` emits machine-readable rows (slug, name, Nexus domain, Steam ID). |
 
 ### Profiles (per-game named load-order snapshots)
 
@@ -419,12 +420,17 @@ The SQLite DB is safe to read concurrently while nexmod is running — WAL is en
 
 | Category | Commands |
 |----------|----------|
-| **Read-only, no network, no API key** | `list`, `list --json`, `history`, `logs`, `path show`, `games`, `profile list`, `profile show`, `config show`, `snapshots`, `fsck`, `rollback --list` |
+| **Read-only, no network, no API key** | `list`, `list --json`, `history`, `logs`, `path show`, `games`, `games --json`, `profile list`, `profile show`, `config show`, `snapshots`, `fsck`, `rollback --list` |
 | **Network / API key required** | `search`, `install`, `track`, `update`, `check`, `scan`, `info`, `info --remote`, `config verify`, `doctor`, `nxm`, `fsck --with-api` |
 
 ### JSON output
 
-Four commands emit machine-readable JSON when passed `--json`:
+Five commands emit machine-readable JSON when passed `--json`:
+
+**`nexmod games --json`** — all supported game slugs:
+```json
+[{"slug":"darktide","name":"Warhammer 40,000: Darktide","domain":"warhammer40kdarktide","steam_id":1361210},...]
+```
 
 **`nexmod search <game> <query> --json`** — search results sorted by endorsements:
 ```json
