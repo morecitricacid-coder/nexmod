@@ -169,12 +169,25 @@ def test_extract_tar_gz_normal(tmp_path):
 # ── extract_archive — unknown extension ──────────────────────────────────────
 
 def test_extract_unknown_extension_copies_file(tmp_path):
+    """Unknown extensions (not .rar) are still copied as-is."""
+    archive = tmp_path / "mod.dat"
+    archive.write_bytes(b"fake data")
+    target = tmp_path / "out"
+    target.mkdir()
+    nexmod.extract_archive(archive, target)
+    assert (target / "mod.dat").exists()
+
+
+def test_extract_rar_raises_clear_error(tmp_path):
+    """.rar archives must raise RuntimeError instead of silently copying."""
     archive = tmp_path / "mod.rar"
     archive.write_bytes(b"fake rar data")
     target = tmp_path / "out"
     target.mkdir()
-    nexmod.extract_archive(archive, target)
-    assert (target / "mod.rar").exists()
+    with pytest.raises(RuntimeError, match=r"\.rar"):
+        nexmod.extract_archive(archive, target)
+    # Raw .rar must NOT be left in target_dir
+    assert not (target / "mod.rar").exists()
 
 
 # ── extract_archive — 7z not installed ───────────────────────────────────────

@@ -29,7 +29,7 @@ from rich.table import Table
 from rich.progress import Progress, DownloadColumn, TransferSpeedColumn, BarColumn, TextColumn
 from rich.syntax import Syntax
 
-__version__ = "1.2.0"
+__version__ = "1.2.1"
 
 console = Console()
 log = logging.getLogger("nexmod")
@@ -83,6 +83,11 @@ GAMES = {
         "steam_id": 1091500,
         "mod_subdir": "archive/pc/mod",
         "log_subpath": None,
+        # Some Cyberpunk mods ship as ModName/archive/pc/mod/file.archive instead of
+        # archive/pc/mod/file.archive.  When extraction into mod_dir creates exactly one
+        # new top-level folder and that folder contains a known game subdir, promote the
+        # contents up to mod_dir so REDlauncher doesn't crash on unexpected top-level dirs.
+        "wrapper_indicators": {"archive", "bin", "r6", "red4ext", "mods"},
     },
     "fallout4": {
         "name": "Fallout 4",
@@ -1221,6 +1226,13 @@ def extract_archive(archive: Path, target_dir: Path):
             )
             if result.returncode != 0:
                 raise RuntimeError(f"7z failed: {result.stderr.strip()}")
+        elif name.endswith(".rar"):
+            raise RuntimeError(
+                f"{archive.name} is a .rar archive, which nexmod does not support.\n"
+                "Download the mod manually from Nexus, then install with:\n"
+                f"  nexmod import <game> <path-to-archive>\n"
+                "(Use a .zip or .7z file if one is available on the mod page.)"
+            )
         else:
             shutil.copy2(archive, target_dir / archive.name)
     except Exception as e:
@@ -1268,6 +1280,61 @@ def _list_archive_files(archive: Path) -> list[str]:
     except Exception as exc:
         log.debug("_list_archive_files failed for %s: %s", archive.name, exc)
     return []
+
+
+def _maybe_promote_wrapper(mod_dir: Path, dirs_before: set[str], game_info: dict) -> bool:
+    """If extraction created exactly one new folder and it looks like a wrapper,
+    promote its contents to mod_dir and remove the wrapper.
+
+    Some mods package their files inside a top-level folder whose name matches
+    the mod name (e.g. ModName/archive/pc/mod/file.archive).  When mod_dir is
+    already the correct destination (e.g. <game_root>/archive/pc/mod), this
+    creates an extra level of nesting that launchers cannot handle.
+
+    Promotion conditions (all must hold):
+    1. game_info contains a non-empty ``wrapper_indicators`` set.
+    2. Exactly one new directory was created in mod_dir after extraction.
+    3. That new directory contains at least one child whose lowercased name
+       matches a string in ``wrapper_indicators``.
+
+    Returns True if promotion happened, False otherwise.
+    """
+    indicators = game_info.get("wrapper_indicators")
+    if not indicators:
+        return False
+
+    dirs_after = {p.name for p in mod_dir.iterdir() if p.is_dir()}
+    new_dirs = dirs_after - dirs_before
+    if len(new_dirs) != 1:
+        return False
+
+    wrapper = mod_dir / next(iter(new_dirs))
+    wrapper_children = {p.name.lower() for p in wrapper.iterdir()}
+    if not wrapper_children & {ind.lower() for ind in indicators}:
+        return False
+
+    # Promote: move each item in wrapper/ up to mod_dir/.
+    for item in list(wrapper.iterdir()):
+        dest = mod_dir / item.name
+        if dest.exists():
+            log.warning(
+                "promote_wrapper: skipping %s — destination already exists", item.name
+            )
+            continue
+        shutil.move(str(item), str(dest))
+
+    try:
+        wrapper.rmdir()  # Should be empty now.
+    except OSError:
+        log.warning(
+            "promote_wrapper: could not remove wrapper dir %s (not empty?)", wrapper
+        )
+
+    log.info("promote_wrapper: promoted %s → %s", wrapper.name, mod_dir)
+    console.print(
+        f"  [dim]Promoted wrapper folder '{wrapper.name}' → mod directory.[/dim]"
+    )
+    return True
 
 
 # ── File Selection ────────────────────────────────────────────────────────────
@@ -1760,6 +1827,8 @@ def do_install(game: str, mod_id: int, file_id_override: int | None,
 
         console.print(f"  Extracting to [dim]{mod_dir}[/dim]...")
         extract_archive(archive, mod_dir)
+        if info:
+            _maybe_promote_wrapper(mod_dir, dirs_before, info)
         extraction_ok = True
         # Save rollback snapshot before the finally clause unlinks the archive.
         # Best-effort: failures here don't fail the install — user just has
@@ -6507,10 +6576,57 @@ def nxm_unregister():
 
 # enable / disable / toggle ───────────────────────────────────────────────────
 
-_DTKIT_NATIVE_URL = (
-    "https://github.com/ManShanko/dtkit-patch/releases/latest/download/"
-    "dtkit-patch-x86_64-unknown-linux-musl.tar.gz"
+_DTKIT_GITHUB_API_URL = (
+    "https://api.github.com/repos/ManShanko/dtkit-patch/releases/latest"
 )
+_DTKIT_MANUAL_URL = "https://github.com/ManShanko/dtkit-patch/releases/latest"
+
+
+def _resolve_dtkit_download_url() -> str:
+    """Query the GitHub releases API to find the current musl-static tarball URL.
+
+    Returns the browser_download_url of the first asset whose name contains
+    'linux-musl' and ends with '.tar.gz'.
+
+    Raises:
+        RuntimeError: if the API call fails or no matching asset is found.
+    """
+    try:
+        r = requests.get(
+            _DTKIT_GITHUB_API_URL,
+            headers={"Accept": "application/vnd.github+json", "User-Agent": "nexmod"},
+            timeout=15,
+        )
+    except requests.RequestException as e:
+        raise RuntimeError(
+            f"Could not reach GitHub releases API to resolve dtkit-patch download URL: {e}\n"
+            f"Download manually from {_DTKIT_MANUAL_URL}"
+        ) from e
+
+    if r.status_code != 200:
+        raise RuntimeError(
+            f"GitHub releases API returned HTTP {r.status_code} for dtkit-patch.\n"
+            f"Download manually from {_DTKIT_MANUAL_URL}"
+        )
+
+    try:
+        data = r.json()
+        assets = data.get("assets", [])
+    except Exception as e:
+        raise RuntimeError(
+            f"Failed to parse GitHub releases API response: {e}\n"
+            f"Download manually from {_DTKIT_MANUAL_URL}"
+        ) from e
+
+    for asset in assets:
+        name = asset.get("name", "")
+        if "linux-musl" in name and name.endswith(".tar.gz"):
+            return asset["browser_download_url"]
+
+    raise RuntimeError(
+        "No linux-musl .tar.gz asset found in the latest dtkit-patch GitHub release.\n"
+        f"Download manually from {_DTKIT_MANUAL_URL}"
+    )
 
 
 def _find_dtkit(game_dir: Path) -> Path | None:
@@ -6526,22 +6642,30 @@ def _find_dtkit(game_dir: Path) -> Path | None:
 def _download_dtkit(game_dir: Path) -> Path:
     """Download the native Linux dtkit-patch binary into <game_dir>/tools/.
 
-    Fetches the musl-static release tarball from GitHub, extracts the binary,
-    marks it executable, and returns its path.
+    Queries the GitHub releases API to resolve the current asset URL (tolerates
+    version changes in the asset filename), fetches the musl-static release
+    tarball, extracts the binary, marks it executable, and returns its path.
 
     Raises:
-        RuntimeError: if the download, extraction, or binary-not-found step fails.
+        RuntimeError: if the API lookup, download, or extraction step fails.
     """
     tools_dir = game_dir / "tools"
     tools_dir.mkdir(parents=True, exist_ok=True)
     dest = tools_dir / "dtkit-patch"
 
+    console.print(f"  Resolving dtkit-patch download URL from GitHub releases API...")
+    download_url = _resolve_dtkit_download_url()
+    log.debug("dtkit-patch download URL resolved: %s", download_url)
+
     console.print(f"  Downloading dtkit-patch (native Linux binary)...")
     try:
-        r = requests.get(_DTKIT_NATIVE_URL, stream=True, timeout=60)
+        r = requests.get(download_url, stream=True, timeout=60)
         r.raise_for_status()
     except requests.RequestException as e:
-        raise RuntimeError(f"Failed to download dtkit-patch: {e}") from e
+        raise RuntimeError(
+            f"Failed to download dtkit-patch: {e}\n"
+            f"Download manually from {_DTKIT_MANUAL_URL}"
+        ) from e
 
     data = r.content
     try:

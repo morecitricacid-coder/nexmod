@@ -231,3 +231,48 @@ def test_remove_purge_force_legacy_uses_filename_stem(tmp_path, runner):
     assert result.exit_code == 0
     assert "legacy fallback" in result.output.lower()
     assert not (mod_dir / "InferredFromFilename").exists()
+
+
+# ── .rar archive guard ───────────────────────────────────────────────────────
+
+class TestRarGuard:
+    """.rar files raise RuntimeError instead of silently copying."""
+
+    def test_rar_raises_runtime_error(self, tmp_path):
+        archive = tmp_path / "coolmod.rar"
+        archive.write_bytes(b"Rar!\x1a\x07fake rar content")
+        target = tmp_path / "target"
+        target.mkdir()
+        with pytest.raises(RuntimeError) as exc_info:
+            nexmod.extract_archive(archive, target)
+        msg = str(exc_info.value)
+        assert ".rar" in msg
+        assert "nexmod import" in msg
+
+    def test_rar_error_mentions_manual_url_hint(self, tmp_path):
+        archive = tmp_path / "somemod.rar"
+        archive.write_bytes(b"fake rar")
+        target = tmp_path / "target"
+        target.mkdir()
+        with pytest.raises(RuntimeError) as exc_info:
+            nexmod.extract_archive(archive, target)
+        assert ".zip" in str(exc_info.value) or ".7z" in str(exc_info.value)
+
+    def test_rar_does_not_copy_file_to_target(self, tmp_path):
+        """Raw .rar must not land in target_dir after the failed call."""
+        archive = tmp_path / "coolmod.rar"
+        archive.write_bytes(b"fake rar content")
+        target = tmp_path / "target"
+        target.mkdir()
+        with pytest.raises(RuntimeError):
+            nexmod.extract_archive(archive, target)
+        assert not (target / "coolmod.rar").exists()
+
+    def test_zip_still_extracts_normally(self, tmp_path):
+        """Regression guard: .zip extraction must be unaffected."""
+        archive = tmp_path / "mod.zip"
+        with zipfile.ZipFile(archive, "w") as zf:
+            zf.writestr("MyMod/script.lua", "-- mod code")
+        target = tmp_path / "target"
+        nexmod.extract_archive(archive, target)
+        assert (target / "MyMod" / "script.lua").exists()

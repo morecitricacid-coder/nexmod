@@ -328,9 +328,12 @@ class TestRunDtkit:
 
 
 class TestDownloadDtkit:
-    """_download_dtkit: tarball fetch → extract → chmod +x."""
+    """_download_dtkit: GitHub API asset resolution + tarball fetch → extract → chmod +x."""
 
-    def _make_fake_tarball(self, tmp_path, member_name="dtkit-patch"):
+    _FAKE_API_URL = nexmod._DTKIT_GITHUB_API_URL
+    _FAKE_DOWNLOAD_URL = "https://github.com/ManShanko/dtkit-patch/releases/download/0.1.8/dtkit-patch-0.1.8-x86_64-unknown-linux-musl.tar.gz"
+
+    def _make_fake_tarball(self, member_name="dtkit-patch"):
         """Build a minimal .tar.gz in memory with a fake binary member."""
         import io
         import tarfile as tf_mod
@@ -342,12 +345,28 @@ class TestDownloadDtkit:
             tf.addfile(info, io.BytesIO(data))
         return buf.getvalue()
 
+    def _fake_releases_json(self, download_url=None):
+        """Build a fake GitHub releases API response with one matching asset."""
+        url = download_url or self._FAKE_DOWNLOAD_URL
+        return {
+            "tag_name": "0.1.8",
+            "assets": [
+                {
+                    "name": "dtkit-patch-0.1.8-x86_64-unknown-linux-musl.tar.gz",
+                    "browser_download_url": url,
+                }
+            ],
+        }
+
     def test_download_dtkit_success(self, tmp_path):
-        """Happy path: tarball downloaded, binary extracted and marked +x."""
+        """Happy path: API resolves asset URL, tarball downloaded, binary extracted and marked +x."""
         import responses as resp
-        tarball = self._make_fake_tarball(tmp_path)
+        tarball = self._make_fake_tarball()
+        releases_json = self._fake_releases_json()
         with resp.RequestsMock() as rsps:
-            rsps.add(resp.GET, nexmod._DTKIT_NATIVE_URL,
+            rsps.add(resp.GET, self._FAKE_API_URL,
+                     json=releases_json, status=200)
+            rsps.add(resp.GET, self._FAKE_DOWNLOAD_URL,
                      body=tarball, status=200,
                      content_type="application/gzip")
             result = nexmod._download_dtkit(tmp_path)
@@ -355,21 +374,77 @@ class TestDownloadDtkit:
         assert result.name == "dtkit-patch"
         assert result.stat().st_mode & 0o111, "binary should be executable"
 
-    def test_download_dtkit_network_error_raises(self, tmp_path):
-        """Network failure raises RuntimeError."""
+    def test_download_dtkit_uses_resolved_url(self, tmp_path):
+        """The download uses the browser_download_url from the API response, not a hard-coded URL."""
+        import responses as resp
+        custom_url = "https://github.com/ManShanko/dtkit-patch/releases/download/0.2.0/dtkit-patch-0.2.0-x86_64-unknown-linux-musl.tar.gz"
+        tarball = self._make_fake_tarball()
+        releases_json = self._fake_releases_json(download_url=custom_url)
+        with resp.RequestsMock() as rsps:
+            rsps.add(resp.GET, self._FAKE_API_URL,
+                     json=releases_json, status=200)
+            rsps.add(resp.GET, custom_url,
+                     body=tarball, status=200,
+                     content_type="application/gzip")
+            result = nexmod._download_dtkit(tmp_path)
+        assert result.exists()
+
+    def test_download_dtkit_no_matching_asset_raises(self, tmp_path):
+        """If releases JSON has no linux-musl .tar.gz asset, RuntimeError with manual URL."""
+        import responses as resp
+        bad_releases = {
+            "tag_name": "0.1.8",
+            "assets": [
+                {"name": "dtkit-patch-0.1.8-windows.zip",
+                 "browser_download_url": "https://example.com/windows.zip"},
+            ],
+        }
+        with resp.RequestsMock() as rsps:
+            rsps.add(resp.GET, self._FAKE_API_URL,
+                     json=bad_releases, status=200)
+            with pytest.raises(RuntimeError) as exc_info:
+                nexmod._download_dtkit(tmp_path)
+        assert "linux-musl" in str(exc_info.value) or nexmod._DTKIT_MANUAL_URL in str(exc_info.value)
+
+    def test_download_dtkit_api_non_200_raises(self, tmp_path):
+        """Non-200 from GitHub API raises RuntimeError."""
         import responses as resp
         with resp.RequestsMock() as rsps:
-            rsps.add(resp.GET, nexmod._DTKIT_NATIVE_URL, status=500)
+            rsps.add(resp.GET, self._FAKE_API_URL, status=503)
+            with pytest.raises(RuntimeError, match="503"):
+                nexmod._download_dtkit(tmp_path)
+
+    def test_download_dtkit_api_request_exception_raises(self, tmp_path):
+        """Network error on GitHub API call raises RuntimeError."""
+        import responses as resp
+        import requests
+        with resp.RequestsMock() as rsps:
+            rsps.add(resp.GET, self._FAKE_API_URL,
+                     body=requests.ConnectionError("network down"))
+            with pytest.raises(RuntimeError, match="GitHub releases API"):
+                nexmod._download_dtkit(tmp_path)
+
+    def test_download_dtkit_tarball_network_error_raises(self, tmp_path):
+        """Network failure on tarball download raises RuntimeError."""
+        import responses as resp
+        releases_json = self._fake_releases_json()
+        with resp.RequestsMock() as rsps:
+            rsps.add(resp.GET, self._FAKE_API_URL,
+                     json=releases_json, status=200)
+            rsps.add(resp.GET, self._FAKE_DOWNLOAD_URL, status=500)
             with pytest.raises(RuntimeError, match="download"):
                 nexmod._download_dtkit(tmp_path)
 
     def test_download_dtkit_creates_tools_dir(self, tmp_path):
         """tools/ dir is created if it doesn't exist."""
         import responses as resp
-        tarball = self._make_fake_tarball(tmp_path)
+        tarball = self._make_fake_tarball()
+        releases_json = self._fake_releases_json()
         assert not (tmp_path / "tools").exists()
         with resp.RequestsMock() as rsps:
-            rsps.add(resp.GET, nexmod._DTKIT_NATIVE_URL,
+            rsps.add(resp.GET, self._FAKE_API_URL,
+                     json=releases_json, status=200)
+            rsps.add(resp.GET, self._FAKE_DOWNLOAD_URL,
                      body=tarball, status=200,
                      content_type="application/gzip")
             nexmod._download_dtkit(tmp_path)

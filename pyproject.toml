@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "nexmod"
-version = "1.2.0"
+version = "1.2.1"
 description = "Linux-native CLI mod manager for Nexus Mods (requires Premium)"
 readme = "README.md"
 license = { text = "MIT" }

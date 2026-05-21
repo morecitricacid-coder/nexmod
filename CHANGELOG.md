@@ -23,6 +23,34 @@ All notable changes to nexmod are documented here. Format follows
 
 ---
 
+## [1.2.1] — 2026-05-21 — Bug fixes: dtkit download, .rar detection, Cyberpunk path promotion
+
+### Fixed
+
+- **`_download_dtkit()`: resolve asset URL dynamically from GitHub API** — dtkit-patch
+  releases 0.1.7+ include the version number in the asset filename
+  (`dtkit-patch-0.1.8-x86_64-unknown-linux-musl.tar.gz`). The previous hard-coded
+  versionless URL resulted in a 404 on every fresh `nexmod setup` for Darktide. The
+  function now queries `api.github.com/repos/ManShanko/dtkit-patch/releases/latest`,
+  finds the asset whose name contains `linux-musl` and ends with `.tar.gz`, and uses
+  that `browser_download_url`. A clear error message with the manual download URL is
+  shown if the API call or asset lookup fails.
+- **`.rar` archives now raise a clear error instead of silently copying the raw archive**
+  — previously, `.rar` files were extracted into mod_dir as-is (the raw `.rar` file was
+  copied, not extracted), so the mod never loaded and no error was shown. Extraction now
+  fails immediately with a message explaining that `.rar` is not supported and directing
+  the user to `nexmod import` with a `.zip` or `.7z` file if one is available.
+- **Cyberpunk 2077: wrapper-folder mods now have their contents promoted to mod_dir
+  automatically after extraction** — some mods are packaged as
+  `ModName/archive/pc/mod/file.archive` instead of `archive/pc/mod/file.archive`. When
+  extracted into `mod_dir` (which is already `<game_root>/archive/pc/mod`), the content
+  previously landed at `.../archive/pc/mod/ModName/archive/pc/mod/file.archive`, causing
+  REDlauncher to crash on the unexpected top-level structure. After extraction, nexmod
+  now detects a single new top-level folder whose children include a known game subdir
+  (`archive`, `bin`, `r6`, `red4ext`, `mods`) and promotes its contents up to mod_dir.
+
+---
+
 ## [1.2.0] — 2026-04-29
 
 ### Added
